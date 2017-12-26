@@ -1,0 +1,19 @@
+{
+  "name": "flowp-layer",
+  "homepage": "https://github.com/flowplayer/flowplayer",
+  "version": "7.2.1",
+  "main": [
+    "skin/skin.css",
+    "flowplayer.min.js"
+  ],
+  "_release": "7.2.1",
+  "_resolution": {
+    "type": "version",
+    "tag": "7.2.1",
+    "commit": "a3011b2efd5024cb91ff56c8505fd06e2cfb9843"
+  },
+  "_source": "https://github.com/flowplayer/flowplayer.git",
+  "_target": "^7.2.1",
+  "_originalSource": "flowplayer",
+  "_direct": true
+}

@@ -1,0 +1,6 @@
+.DS_Store
+*.ipr
+*.iws
+node_modules
+npm-debug.log
+.idea/

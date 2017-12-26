@@ -1,0 +1,28 @@
+{
+  "name": "flowplayer",
+  "version": "7.2.1",
+  "description": "The HTML5 video player for the web",
+  "main": "flowplayer.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {},
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/flowplayer/flowplayer.git"
+  },
+  "author": "",
+  "license": "GPLv3",
+  "bugs": {
+    "url": "https://github.com/flowplayer/flowplayer/issues"
+  },
+  "jshintConfig": {
+    "browser": true,
+    "node": true,
+    "strict": true,
+    "newcap": false,
+    "multistr": true
+  },
+  "devDependencies": {},
+  "dependencies": {}
+}
