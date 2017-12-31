@@ -3,7 +3,7 @@
   "homepage": "https://github.com/flowplayer/flowplayer",
   "version": "7.2.1",
   "main": [
-    "skin/skin.css",
+    "skin/sass/skin.sass",
     "flowplayer.js"
   ],
   "_release": "7.2.1",
