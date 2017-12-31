@@ -1207,7 +1207,7 @@ function html5factory(engineName, player, root, canPlay, ext) {
               end: api.buffered.end(i)
             });
           }
-          if (api.buffered.end(null) === api.duration) triggerEvent('buffered');
+          if (api.buffered.length && api.buffered.end(null) === api.duration) triggerEvent('buffered');
           break;
 
         case 'speed':
@@ -4528,7 +4528,7 @@ function initializePlayer(element, opts, callback) {
          }).on("progress", function(e, api, time) {
             api.video.time = time;
          }).on('buffer', function(e, api, buffered) {
-            api.video.buffer = typeof buffered === 'number' ? buffered : buffered[buffered.length - 1].end;
+             api.video.buffer = typeof buffered === 'number' ? buffered : buffered.length ? buffered[buffered.length - 1].end : 0;
          }).on("speed", function(e, api, val) {
             api.currentSpeed = val;
 
