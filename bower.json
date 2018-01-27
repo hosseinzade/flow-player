@@ -1,19 +1,19 @@
 {
   "name": "flow-player",
   "homepage": "https://github.com/flowplayer/flowplayer",
-  "version": "7.0.4",
+  "version": "7.2.4",
   "main": [
     "skin/sass/skin.sass",
     "flowplayer.js"
   ],
-  "_release": "7.0.4",
+  "_release": "7.2.4",
   "_resolution": {
     "type": "version",
-    "tag": "7.0.4",
+    "tag": "7.2.4",
     "commit": "a3011b2efd5024cb91ff56c8505fd06e2cfb9843"
   },
   "_source": "https://github.com/flowplayer/flowplayer.git",
-  "_target": "^7.0.4",
+  "_target": "^7.2.4",
   "_originalSource": "flowplayer",
   "_direct": true
 }

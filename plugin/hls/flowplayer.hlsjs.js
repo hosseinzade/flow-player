@@ -29,9 +29,6 @@
             extend = flowplayer.extend,
             support = flowplayer.support,
             brwsr = support.browser,
-            desktopSafari = brwsr.safari && support.dataload,
-            androidChrome = (support.android && !support.android.firefox) ||
-                    (!support.firstframe && support.dataload && !brwsr.mozilla),
             version = flowplayer.version,
             coreV6 = version.indexOf("6.") === 0,
             win = window,
@@ -47,6 +44,67 @@
                 return support.inlineVideo &&
                         (hlsQualities === true ||
                         (hlsQualities && hlsQualities.length));
+            },
+            destroyVideoTag = function (root) {
+                var vtag = common.findDirect("video", root)[0]
+                        || common.find(".fp-player>video", root)[0];
+
+                if (vtag) {
+                    common.find("source", vtag).forEach(function (source) {
+                        source.removeAttribute("src");
+                    });
+                    vtag.removeAttribute("src");
+                    vtag.load();
+                    common.removeNode(vtag);
+                }
+            },
+
+            textencoding = require("text-encoding"),
+            Decoder = new textencoding.TextDecoder("utf-8"),
+            uint8ArrayToString = function (arr) {
+                var txt = "";
+
+                try {
+                    txt = Decoder.decode(arr);
+                } catch (ignore) {
+                    try {
+                        Decoder = new textencoding.TextDecoder("utf-16be");
+                        txt = Decoder.decode(arr);
+                    } catch (ignore) {
+                        try {
+                            Decoder = new textencoding.TextDecoder("utf-16le");
+                            txt = Decoder.decode(arr);
+                        } catch (ignore) {}
+                    }
+                }
+                return txt;
+            },
+
+            loadHlsSubtitle = function (api, entry, num) {
+                entry.title = entry.title || num + "";
+
+                var cue = {
+                    time: entry.startTime,
+                    subtitle: entry,
+                    visible: false
+                };
+
+                api.subtitles.push(entry);
+                api.addCuepoint(cue);
+                api.addCuepoint({
+                    time: entry.endTime,
+                    subtitleEnd: entry.title,
+                    visible: false
+                });
+                // initial cuepoint
+                if (entry.startTime === 0 && !api.video.time && !api.splash) {
+                    api.trigger("cuepoint", [api, cue]);
+                }
+                if (api.splash) {
+                    api.one("ready." + engineName, function () {
+                        api.trigger('cuepoint', [api, cue]);
+                    });
+                }
             },
 
             engineImpl = function hlsjsEngine(player, root) {
@@ -157,6 +215,127 @@
                         common.find(".fp-audio-menu", root).forEach(common.removeNode);
                         common.find(".fp-audio", root).forEach(common.removeNode);
                     },
+
+                    nativeSubs,
+                    hlsSubtitles,
+                    setActiveSubtitleClass = function (idx) {
+                        var menu = common.find(".fp-subtitle-menu", root)[0];
+
+                        common.toggleClass(common.find('a.fp-selected', menu)[0], 'fp-selected');
+                        common.toggleClass(common.find('a[data-subtitle-index="' + idx + '"]', menu)[0], 'fp-selected');
+                    },
+                    updateSubtitles = function (data, conf) {
+                        var entries = uint8ArrayToString(data.payload),
+                            id = data.frag.trackId;
+
+                        if (!entries) {
+                            return;
+                        }
+                        if (!hlsSubtitles[id]) {
+                            hlsSubtitles[id] = [];
+                        }
+                        entries = conf.subtitleParser(entries);
+                        entries.forEach(function (entry) {
+                            if (entry.text) {
+                                hlsSubtitles[id].push(entry);
+                                if (player.ready) {
+                                    loadHlsSubtitle(player, entry, hlsSubtitles[id].length);
+                                    if (player.live) {
+                                        var seekOffset = player.video.seekOffset;
+
+                                        hlsSubtitles[id] = hlsSubtitles[id].filter(function (sub) {
+                                            return sub.endTime >= seekOffset;
+                                        });
+                                        player.subtitles = player.subtitles.filter(function (sub) {
+                                            return sub.endTime >= seekOffset;
+                                        });
+                                        player.cuepoints.forEach(function (cue) {
+                                            if (cue.subtitle && cue.time < seekOffset) {
+                                                player.removeCuepoint(cue);
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                    },
+                    disableSubtitleTracks = function () {
+                        [].forEach.call(videoTag.textTracks, function (track) {
+                            if (track.kind === "subtitles") {
+                                track.mode = "hidden";
+                            }
+                        });
+                    },
+                    initSubtitles = function (data, conf) {
+                        var subtitleTracks = data.subtitleTracks;
+
+                        if (!conf.subtitles || !subtitleTracks.length || !support.inlineVideo || coreV6) {
+                            return;
+                        }
+                        // can there be more than 1 groupId?
+                        subtitleTracks = subtitleTracks.filter(function (subtitleTrack) {
+                            return subtitleTrack.groupId === subtitleTracks[0].groupId;
+                        });
+                        player.video.subtitles = subtitleTracks.map(function (subtitleTrack) {
+                            // fake tracks
+                            var track = {
+                                kind: "subtitles",
+                                id: subtitleTrack.id,
+                                srclang: subtitleTrack.lang,
+                                label: subtitleTrack.name,
+                                "default": subtitleTrack.default
+                            };
+                            common.append(videoTag, common.createElement("track", track));
+                            return track;
+                        });
+                        player.on("ready." + engineName, function (_e, api) {
+                            var tracks = hls.subtitleTracks,
+                                defaultTrack;
+
+                            if (!tracks || !tracks.length) {
+                                return;
+                            }
+                            if (nativeSubs) {
+                                common.addClass(videoTag, "native-subtitles");
+                            } else {
+                                disableSubtitleTracks();
+                            }
+                            tracks.map(function (sub, idx) {
+                                if (sub.default) {
+                                    hls.subtitleTrack = idx;
+                                }
+                            });
+                            defaultTrack = hls.subtitleTrack;
+                            if (defaultTrack > -1) {
+                                if (!nativeSubs && hlsSubtitles[defaultTrack]) {
+                                    hlsSubtitles[defaultTrack].forEach(function (entry, i) {
+                                        loadHlsSubtitle(api, entry, i + 1);
+                                    });
+                                }
+                                setActiveSubtitleClass(defaultTrack);
+                            } else {
+                                setActiveSubtitleClass(-1);
+                            }
+                        });
+                        bean.on(root, "click." + engineName, ".fp-subtitle-menu [data-subtitle-index]", function (e) {
+                            e.preventDefault();
+                            var idx = e.target.getAttribute("data-subtitle-index");
+
+                            player.disableSubtitles();
+                            hls.subtitleTrack = idx;
+                            if (idx < 0) {
+                                disableSubtitleTracks();
+                                return;
+                            }
+                            setActiveSubtitleClass(idx);
+                            if (!nativeSubs && hlsSubtitles[idx]) {
+                                hlsSubtitles[idx].forEach(function (entry, i) {
+                                    loadHlsSubtitle(player, entry, i + 1);
+                                });
+                            }
+                        });
+                    },
+
                     initAudio = function (data) {
                         audioGroups = [];
                         audioUXGroup = [];
@@ -463,12 +642,7 @@
                             var conf = player.conf,
                                 EVENTS = {
                                     ended: "finish",
-                                    loadeddata: !desktopSafari
-                                        ? "ready"
-                                        : 0,
-                                    canplaythrough: desktopSafari
-                                        ? "ready"
-                                        : 0,
+                                    loadeddata: "ready",
                                     pause: "pause",
                                     play: "resume",
                                     progress: "buffer",
@@ -479,7 +653,7 @@
                                     error: "error"
                                 },
                                 HLSEVENTS = Hls.Events,
-                                autoplay = !!video.autoplay || !!conf.autoplay,
+                                autoplay = !!video.autoplay || !!conf.autoplay || !!conf.splash,
                                 hlsQualitiesConf = video.hlsQualities || conf.hlsQualities,
                                 hlsUpdatedConf = extend(hlsconf, conf.hlsjs, video.hlsjs),
                                 hlsClientConf = extend({}, hlsUpdatedConf);
@@ -488,22 +662,11 @@
                             if (video.hlsQualities === false) {
                                 hlsQualitiesConf = false;
                             }
+                            nativeSubs = hlsUpdatedConf.subtitles &&
+                                    support.subtitles && conf.nativesubtitles;
 
                             if (!hls) {
-                                videoTag = common.findDirect("video", root)[0]
-                                        || common.find(".fp-player > video", root)[0];
-
-                                if (videoTag) {
-                                    // destroy video tag
-                                    // otherwise <video autoplay> continues to play
-                                    common.find("source", videoTag).forEach(function (source) {
-                                        source.removeAttribute("src");
-                                    });
-                                    videoTag.removeAttribute("src");
-                                    videoTag.load();
-                                    common.removeNode(videoTag);
-                                }
-
+                                destroyVideoTag(root);
                                 videoTag = common.createElement("video", {
                                     "class": "fp-engine " + engineName + "-engine",
                                     "autoplay": autoplay
@@ -511,6 +674,9 @@
                                         : false,
                                     "volume": player.volumeLevel
                                 });
+                                if (support.mutedAutoplay && !conf.splash && autoplay) {
+                                    videoTag.muted = true;
+                                }
 
                                 Object.keys(EVENTS).forEach(function (key) {
                                     var flow = EVENTS[key],
@@ -525,8 +691,11 @@
                                         var ct = videoTag.currentTime,
                                             seekable = videoTag.seekable,
                                             updatedVideo = player.video,
-                                            seekOffset = updatedVideo.seekOffset,
-                                            liveSyncPosition = player.live && hls.liveSyncPosition,
+                                            liveResumePosition = player.dvr
+                                                ? updatedVideo.seekOffset
+                                                : player.live
+                                                    ? hls.liveSyncPosition
+                                                    : 0,
                                             buffered = videoTag.buffered,
                                             i,
                                             buffends = [],
@@ -550,6 +719,9 @@
                                             if (!hlsUpdatedConf.bufferWhilePaused) {
                                                 hls.startLoad(ct);
                                             }
+                                            if (ct < liveResumePosition) {
+                                                videoTag.currentTime = liveResumePosition;
+                                            }
                                             break;
                                         case "seek":
                                             removePoster();
@@ -564,18 +736,6 @@
                                             }
                                             break;
                                         case "progress":
-                                            if (liveSyncPosition) {
-                                                updatedVideo.duration = liveSyncPosition;
-                                                if (player.dvr) {
-                                                    player.trigger('dvrwindow', [player, {
-                                                        start: seekOffset,
-                                                        end: liveSyncPosition
-                                                    }]);
-                                                    if (ct < seekOffset) {
-                                                        videoTag.currentTime = seekOffset;
-                                                    }
-                                                }
-                                            }
                                             arg = ct;
                                             break;
                                         case "speed":
@@ -666,6 +826,8 @@
 
                             } else {
                                 hls.destroy();
+                                common.find("track", videoTag).forEach(common.removeNode);
+                                common.removeClass(videoTag, "native-subtitles");
                                 if ((player.video.src && video.src !== player.video.src) || video.index) {
                                     common.attr(videoTag, "autoplay", "autoplay");
                                 }
@@ -727,6 +889,8 @@
                             player.engine[engineName] = hls;
                             recoverMediaErrorDate = null;
                             swapAudioCodecDate = null;
+                            player.disableSubtitles();
+                            hlsSubtitles = {};
 
                             Object.keys(HLSEVENTS).forEach(function (key) {
                                 var etype = HLSEVENTS[key],
@@ -753,13 +917,29 @@
                                     case "MANIFEST_LOADED":
                                         initAudio(data);
                                         break;
+                                    case "SUBTITLE_TRACKS_UPDATED":
+                                        initSubtitles(data, hlsUpdatedConf);
+                                        break;
                                     case "MEDIA_ATTACHED":
                                         hls.loadSource(src);
                                         break;
                                     case "FRAG_LOADED":
+                                        if (data.frag.type === "subtitle" && hlsUpdatedConf.subtitles && !nativeSubs) {
+                                            updateSubtitles(data, conf);
+                                        }
                                         if (hlsUpdatedConf.bufferWhilePaused && !player.live &&
                                                 hls.autoLevelEnabled && hls.nextLoadLevel > maxLevel) {
                                             maxLevel = hls.nextLoadLevel;
+                                        }
+                                        break;
+                                    case "SUBTITLE_TRACK_SWITCH":
+                                        if (nativeSubs) {
+                                            [].forEach.call(videoTag.textTracks, function (track) {
+                                                track.mode = (hls.subtitleTracks[data.id].lang === track.language &&
+                                                        track.kind === "subtitles")
+                                                    ? "showing"
+                                                    : "hidden";
+                                            });
                                         }
                                         break;
                                     case "FRAG_PARSING_METADATA":
@@ -775,19 +955,11 @@
                                                 }
                                                 bean.off(videoTag, 'timeupdate.' + engineName, metadataHandler);
 
-                                                var raw = sample.unit || sample.data,
-                                                    Decoder = win.TextDecoder;
+                                                var txt = uint8ArrayToString(sample.unit || sample.data);
 
-                                                if (Decoder && typeof Decoder === "function") {
-                                                    raw = new Decoder('utf-8').decode(raw);
-                                                } else {
-                                                    raw = decodeURIComponent(encodeURIComponent(
-                                                        String.fromCharCode.apply(null, raw)
-                                                    ));
-                                                }
                                                 player.trigger('metadata', [player, {
-                                                    key: raw.substr(10, 4),
-                                                    data: raw
+                                                    key: txt.substr(10, 4),
+                                                    data: txt
                                                 }]);
                                             };
                                             bean.on(videoTag, 'timeupdate.' + engineName, metadataHandler);
@@ -795,7 +967,16 @@
                                         break;
                                     case "LEVEL_UPDATED":
                                         if (player.live) {
-                                            player.video.seekOffset = data.details.fragments[0].start + hls.config.nudgeOffset;
+                                            extend(updatedVideo, {
+                                                seekOffset: data.details.fragments[0].start + hls.config.nudgeOffset,
+                                                duration: hls.liveSyncPosition
+                                            });
+                                            if (player.dvr && player.playing) {
+                                                player.trigger('dvrwindow', [player, {
+                                                    start: updatedVideo.seekOffset,
+                                                    end: hls.liveSyncPosition
+                                                }]);
+                                            }
                                         }
                                         break;
                                     case "LEVEL_SWITCHED":
@@ -860,13 +1041,15 @@
 
                             hls.attachMedia(videoTag);
 
-                            if (androidChrome && autoplay && videoTag.paused) {
+                            if (autoplay && videoTag.paused) {
                                 var playPromise = videoTag.play();
                                 if (playPromise !== undefined) {
                                     playPromise.catch(function () {
-                                        player.unload();
-                                        if (!coreV6) {
-                                            player.message("Please click the play button", 3000);
+                                        if (!support.mutedAutoplay) {
+                                            player.unload();
+                                            if (!coreV6) {
+                                                player.message("Please click the play button", 3000);
+                                            }
                                         }
                                     });
                                 }
@@ -882,7 +1065,9 @@
                         },
 
                         seek: function (time) {
-                            videoTag.currentTime = time;
+                            if (videoTag) {
+                                videoTag.currentTime = time;
+                            }
                         },
 
                         volume: function (level) {
@@ -900,6 +1085,7 @@
                             if (hls) {
                                 var listeners = "." + engineName;
 
+                                player.disableSubtitles();
                                 hls.destroy();
                                 hls = 0;
                                 qClean();
@@ -931,6 +1117,7 @@
         if (Hls.isSupported() && version.indexOf("5.") !== 0) {
             // only load engine if it can be used
             engineImpl.engineName = engineName; // must be exposed
+            engineImpl[engineName + "ClientVersion"] = Hls.version;
             engineImpl.canPlay = function (type, conf) {
                 if (conf[engineName] === false || conf.clip[engineName] === false) {
                     // engine disabled for player
@@ -945,20 +1132,33 @@
                 }, conf[engineName], conf.clip[engineName]);
 
                 // https://github.com/dailymotion/hls.js/issues/9
-                return isHlsType(type) && (!desktopSafari || hlsconf.safari);
+                return isHlsType(type) && (!(brwsr.safari && support.dataload) || hlsconf.safari);
             };
+
+            flowplayer(function (api, root) {
+                var c = api.conf;
+
+                if (coreV6) {
+                    // to take precedence over VOD quality selector
+                    api.pluginQualitySelectorEnabled = hlsQualitiesSupport(c) &&
+                            engineImpl.canPlay("application/x-mpegurl", c);
+
+                } else if (support.mutedAutoplay && !c.splash && !c.autoplay &&
+                        (version === "7.1.0" || version === "7.0.0")) {
+                    // issue #94
+                    api.splash = true;
+                    c.splash = typeof c.poster === "string"
+                        ? c.poster
+                        : true;
+                    c.poster = undefined;
+                    c.autoplay = true;
+                    destroyVideoTag(root);
+                }
+            });
 
             // put on top of engine stack
             // so hlsjs is tested before html5 video hls and flash hls
             flowplayer.engines.unshift(engineImpl);
-
-            if (coreV6) {
-                flowplayer(function (api) {
-                    // to take precedence over VOD quality selector
-                    api.pluginQualitySelectorEnabled = hlsQualitiesSupport(api.conf) &&
-                            engineImpl.canPlay("application/x-mpegurl", api.conf);
-                });
-            }
         }
 
     };

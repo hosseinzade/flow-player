@@ -1,6 +1,6 @@
 /*!
 
-   Flowplayer v7.0.4 (Friday, 28. April 2017 01:12PM) | flowplayer.org/license
+   Flowplayer v7.2.4 (Tuesday, 23. January 2018 12:27PM) | flowplayer.com/license
 
 */
 /*! (C) WebReflection Mit Style License */
@@ -74,7 +74,7 @@ common.createElement = function(tag, attributes, innerHTML) {
         common.attr(el, key, attributes[key]);
       }
     }
-    el.innerHTML = innerHTML || '';
+    if (innerHTML) el.innerHTML = innerHTML;
     return el;
   } catch (e) {
     if (!$) throw e;
@@ -193,7 +193,12 @@ common.lastChild = function(el) {
 common.hasParent = function(el, parentSelector) {
   var parent = el.parentElement;
   while (parent) {
-    if (common.matches(parent, parentSelector)) return true;
+    if (typeof parentSelector !== 'string') {
+      // is an element
+      if (parent === parentSelector) return true;
+    } else {
+      if (common.matches(parent, parentSelector)) return true;
+    }
     parent = parent.parentElement;
   }
   return false;
@@ -298,7 +303,7 @@ common.matches = function(elem, selector) {
 
 })(window.CSSStyleDeclaration.prototype);
 
-},{"class-list":33,"computed-style":34,"punycode":41}],2:[function(_dereq_,module,exports){
+},{"class-list":36,"computed-style":37,"punycode":44}],2:[function(_dereq_,module,exports){
 'use strict';
 var common = _dereq_('../common');
 
@@ -470,6 +475,7 @@ engineImpl = function flashEngine(player, root) {
               if ((conf.rtmp || {}).hasOwnProperty(key)) opts[key] = (conf.rtmp || {})[key];
               if ((video.rtmp || {}).hasOwnProperty(key)) opts[key] = (video.rtmp || {})[key];
             });
+            if (conf.splash) opts.autoplay = true;
             if (conf.rtmp) opts.rtmp = conf.rtmp.url || conf.rtmp;
             if (video.rtmp) opts.rtmp = video.rtmp.url || video.rtmp;
             Object.keys(video.flashls || {}).forEach(function(key) {
@@ -514,7 +520,12 @@ engineImpl = function flashEngine(player, root) {
                   player.video.hlsQualities :
                     player.conf.hlsQualities;
               if (!hlsQualities) return;
-              api.__quality(quality);
+              try {
+                api.__quality(quality);
+              } catch (e) {
+                // VOD / RTMP engine does not support quality
+                player.debug('Error changing quality in flash engine', e);
+              }
             });
 
             // throw error if no loading occurs
@@ -723,48 +734,559 @@ function isAbsolute(url) {
   return /^https?:/.test(url);
 }
 
-},{"../common":1,"../flowplayer":28,"./embed":2,"bean":31,"extend-object":36}],4:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"./embed":2,"bean":34,"extend-object":39}],4:[function(_dereq_,module,exports){
 'use strict';
-var flowplayer = _dereq_('../flowplayer'),
-    bean = _dereq_('bean'),
-    extend = _dereq_('extend-object'),
-    common = _dereq_('../common');
-var VIDEO = document.createElement('video');
+var flowplayer = _dereq_('../flowplayer')
+  , support = flowplayer.support
+  , common = flowplayer.common
+  , html5factory = _dereq_('./html5-factory');
 
-// HTML5 --> Flowplayer event
-var EVENTS = {
 
-   // fired
-   ended: 'finish',
-   pause: 'pause',
-   play: 'resume',
-  //progress: 'buffer',
-   timeupdate: 'progress',
-   volumechange: 'volume',
-   ratechange: 'speed',
-   //seeking: 'beforeseek',
-   seeked: 'seek',
-   // abort: 'resume',
 
-   // not fired
-   loadeddata: 'ready',
-   // loadedmetadata: 0,
-   // canplay: 0,
+function canPlay(type) {
+  if (typeof window.Hls === 'undefined') return false;
+  return /mpegurl/.test(type) && window.Hls.isSupported();
+}
 
-   // error events
-   // load: 0,
-   // emptied: 0,
-   // empty: 0,
-   error: 'error',
-   dataunavailable: 'error',
-   webkitendfullscreen: !flowplayer.support.inlineVideo && 'unload'
+var engine;
 
+engine = function(player, root) {
+
+  var hls, Hls = window.Hls
+    , lastSelectedLevel
+    , lastSource;
+
+  return html5factory('hlsjs-lite', player, root, canPlay, function(video, api, engineApi) {
+    hls = engine.hls = new Hls(flowplayer.extend({}, player.conf.hlsjs, video.hlsjs));
+    engine.extensions.forEach(function(ext) {
+      ext(hls, player, root);
+    });
+    hls.loadSource(video.src);
+
+    // API overriders
+    engineApi.resume = function() {
+      if (player.live && !player.dvr) api.currentTime = hls.liveSyncPosition || 0;
+      api.play();
+    };
+
+    engineApi.seek = function(seekTo) {
+      try {
+        if (player.live && !player.dvr) api.currentTime = Math.min(seekTo, hls.liveSyncPosition);
+        else api.currentTime = seekTo;
+      } catch (e) {
+        player.debug('Failed to seek to ', seekTo, e);
+      }
+    };
+
+    // Quality selection
+    player.on('quality', function(_ev, _api, q) {
+      hls.nextLevel = lastSelectedLevel = q;
+    });
+
+
+    hls.on(Hls.Events.MANIFEST_PARSED, function(_, data) {
+      var hlsQualities = video.hlsQualities || player.conf.hlsQualities
+        , confQualities
+        , qualityLabels = {}
+        , levels = data.levels;
+
+      if (hlsQualities === false) return hls.attachMedia(api);
+      if (hlsQualities === 'drive') switch (levels.length) {
+        case 4:
+          confQualities = [1, 2, 3];
+          break;
+        case 5:
+          confQualities = [1, 2, 3, 4];
+          break;
+        case 6:
+          confQualities = [1, 3, 4, 5];
+          break;
+        case 7:
+          confQualities = [1, 3, 5, 6];
+          break;
+        case 8:
+          confQualities = [1, 3, 6, 7];
+          break;
+        default:
+          if (levels.length < 3 || (levels[0].height && levels[2].height && levels[0].height === levels[2].height)) {
+            confQualities = [];
+          } else {
+            confQualities = [1, 2];
+          }
+          break;
+      }
+
+      video.qualities = [{
+        value: -1,
+        label: 'Auto'
+      }]
+
+      if (Array.isArray(hlsQualities)) {
+        video.qualities = [];
+        confQualities = hlsQualities.map(function(q) {
+          if (typeof q.level !== 'undefined') qualityLabels[q.level] = q.label;
+          return typeof q.level !== 'undefined' ? q.level : q;
+        });
+      }
+
+      var initialLevel = -2;
+
+      video.qualities = video.qualities.concat(levels.map(function(level, i) {
+        if (confQualities && confQualities.indexOf(i) === -1) return false;
+        var label = qualityLabels[i] || (Math.min(level.width, level.height) + 'p');
+        if (!qualityLabels[i] && hlsQualities !== 'drive') label += ' (' + Math.round(level.bitrate / 1000) + 'k)';
+        if (i === lastSelectedLevel) initialLevel = i;
+
+        return {
+          value: i,
+          label: label
+        };
+      })).filter(common.identity);
+
+
+      var currentLevel = video.quality = initialLevel === -2 ?  video.qualities[0].value || -1 : initialLevel;
+
+      if (currentLevel !== hls.currentLevel) hls.currentLevel = currentLevel;
+
+      // End quality selection
+
+      hls.attachMedia(api);
+
+      if (lastSource && video.src !== lastSource) api.play();
+      lastSource = video.src;
+    });
+  });
 };
 
-function round(val, per) {
-   per = per || 100;
-   return Math.round(val * per) / per;
+
+engine.canPlay = function(type, conf) {
+  if (support.browser.safari && !(conf.clip && conf.clip.hlsjs || conf.hlsjs || {}).safari) return false;
+  return flowplayer.support.video && canPlay(type);
+};
+
+engine.engineName = 'hlsjs-lite';
+
+engine.plugin = function(extension) {
+  engine.extensions.push(extension);
 }
+
+engine.extensions = [];
+
+flowplayer.engines.push(engine);
+
+},{"../flowplayer":31,"./html5-factory":5}],5:[function(_dereq_,module,exports){
+/*eslint indent: ["error", 2]*/
+/*eslint quotes: ["error", "single"]*/
+
+var flowplayer = _dereq_('../flowplayer')
+  , common = flowplayer.common
+  , support = flowplayer.support
+  , bean = flowplayer.bean
+  , extend = flowplayer.extend;
+
+var desktopSafari = support.browser.safari && !support.iOS;
+// HTML5 --> Flowplayer event
+var EVENTS = {
+  ended: 'finish',
+  pause: 'pause',
+  play: 'resume',
+  timeupdate: 'progress',
+  volumechange: 'volume',
+  ratechange: 'speed',
+  seeked: 'seek',
+  loadedmetadata: !desktopSafari ? 'ready' : 0,
+  canplaythrough: desktopSafari ? 'ready' : 0,
+  durationchange: 'ready',
+  error: 'error',
+  dataunavailable: 'error',
+  webkitendfullscreen: !flowplayer.support.inlineVideo && 'unload',
+  progress: 'buffer'
+};
+
+
+function html5factory(engineName, player, root, canPlay, ext) {
+  var api = common.findDirect('video', root)[0] || common.find('.fp-player > video', root)[0]
+    , conf = player.conf
+    , timer
+    , volumeLevel
+    , self;
+  return self = {
+    engineName: engineName,
+
+    pick: function(sources) {
+      var source = support.video && sources.filter(function(s) {
+        return canPlay(s.type);
+      })[0];
+
+      if (!source) return;
+      if (typeof source.src === 'string') source.src = common.createAbsoluteUrl(source.src);
+      return source;
+    },
+
+    load: function(video) {
+      var container = common.find('.fp-player', root)[0];
+
+      if (!api) {
+        api = document.createElement('video');
+        common.prepend(container, api);
+        api.autoplay = !!conf.splash;
+      }
+      common.addClass(api, 'fp-engine');
+      common.find('track', api).forEach(common.removeNode);
+      api.preload = 'none';
+
+      if (!conf.nativesubtitles) common.attr(api, 'crossorigin', false);
+
+      if (!conf.disableInline) {
+        api.setAttribute('webkit-playsinline', 'true');
+        api.setAttribute('playsinline', 'true');
+      }
+
+      if (!support.inlineVideo) {
+        common.css(api, {
+          position: 'absolute',
+          top: '-9999em'
+        });
+      }
+
+      if (support.subtitles && conf.nativesubtitles && video.subtitles && video.subtitles.length) {
+        common.addClass(api, 'native-subtitles');
+        var subtitles = video.subtitles;
+        var setMode = function(mode) {
+          var tracks = api.textTracks;
+          if (!tracks.length) return;
+          tracks[0].mode = mode;
+        };
+        if (subtitles.some(function(st) { return !common.isSameDomain(st.src); })) common.attr(api, 'crossorigin', 'anonymous');
+        if (typeof api.textTracks.addEventListener === 'function') api.textTracks.addEventListener('addtrack', function() {
+          setMode('disabled');
+          setMode('showing');
+        });
+        subtitles.forEach(function(st) {
+          api.appendChild(common.createElement('track', {
+            kind: 'subtitles',
+            srclang: st.srclang || 'en',
+            label: st.label || 'en',
+            src: st.src,
+            'default': st['default']
+          }));
+        });
+      }
+
+      // IE does not fire delegated timeupdate events
+      bean.off(api, 'timeupdate', common.noop);
+      bean.on(api, 'timeupdate', common.noop);
+
+      common.prop(api, 'loop', false);
+      player.off('.loophack');
+      if (video.loop || conf.loop) {
+        player.on('finish.loophack', function() { player.resume(); });
+      }
+
+      if (typeof volumeLevel !== 'undefined') {
+        api.volume = volumeLevel;
+      }
+
+      ext(video, api, self);
+      if (conf.autoplay || conf.splash || video.autoplay) {
+        player.debug('Autoplay / Splash setup, try to start video');
+        try {
+          if (!support.preloadMetadata) api.load();
+          var p = api.play();
+          if (p && p.catch) {
+            p.catch(function(err) {
+              if (err.name === 'AbortError' && err.code === 20) return;
+              if (!conf.mutedAutoplay) throw new Error('Unable to autoplay');
+              player.debug('Play errored, trying muted', err);
+              player.mute(true, true);
+              return api.play();
+            }).catch(function() {
+              conf.autoplay = false;
+              player.mute(false, true); // Restore volume as playback failed
+              player.trigger('stop', [player]);
+            });
+          }
+        } catch(e) {
+          player.debug('play() error thrown', e);
+        }
+      }
+
+      self._listeners = listen(api, common.find('source', api).concat(api), video) || self._listeners;
+
+      if (conf.autoplay || conf.splash || video.autoplay) return; // No preload check needed
+      var preloadCheck = function() {
+        if (!isInViewport(root)) return;
+        player.debug('player is in viewport, preload');
+        if (support.preloadMetadata) api.preload = 'metadata';
+        else api.load();
+        bean.off(document, 'scroll.preloadviewport');
+      };
+      bean.off(document, 'scroll.preloadviewport');
+      bean.on(document, 'scroll.preloadviewport', function() {
+        window.requestAnimationFrame(preloadCheck);
+      });
+      preloadCheck();
+    },
+
+    mute: function(flag) {
+      api.muted = !!flag;
+      player.trigger('mute', [player, flag]);
+      player.trigger('volume', [player, flag ? 0 : api.volume]);
+    },
+
+    pause: function() {
+      api.pause();
+    },
+
+    resume: function() {
+      api.play();
+    },
+
+    speed: function(val) {
+      api.playbackRate = val;
+    },
+
+    seek: function(time) {
+      try {
+        api.currentTime = time;
+      } catch (ignored) {}
+    },
+
+    volume: function(level) {
+      volumeLevel = level;
+      if (api) {
+        api.volume = level;
+        if (level) self.mute(false);
+      }
+    },
+
+    unload: function() {
+      bean.off(document, 'scroll.preloadviewport');
+      common.find('video.fp-engine', root).forEach(function (videoTag) {
+        if ('MediaSource' in window) {
+          videoTag.src = URL.createObjectURL(new MediaSource());
+        } else {
+          videoTag.src = '';
+        }
+        common.removeNode(videoTag);
+      });
+      timer = clearInterval(timer);
+      var instanceId = root.getAttribute('data-flowplayer-instance-id');
+      delete api.listeners[instanceId];
+      api = 0;
+      if (self._listeners) Object.keys(self._listeners).forEach(function(typ) {
+        self._listeners[typ].forEach(function(l) {
+          root.removeEventListener(typ, l, true);
+        });
+      });
+    }
+  };
+
+  function listen(api, sources, video) {
+      // listen only once
+    var instanceId = root.getAttribute('data-flowplayer-instance-id');
+
+    if (api.listeners && api.listeners.hasOwnProperty(instanceId)) {
+      api.listeners[instanceId] = video;
+      return;
+    }
+    (api.listeners || (api.listeners = {}))[instanceId] = video;
+
+    bean.on(sources, 'error', function(e) {
+      try {
+        if (canPlay(e.target.getAttribute('type'))) {
+          player.trigger('error', [player, { code: 4, video: extend(video, {src: api.src, url: api.src}) }]);
+        }
+      } catch (er) {
+         // Most likely: https://bugzilla.mozilla.org/show_bug.cgi?id=208427
+      }
+    });
+
+    player.on('shutdown', function() {
+      bean.off(sources);
+      bean.off(api, '.dvrhack');
+      player.off('.loophack');
+    });
+
+    var eventListeners = {};
+    //Special event handling for HLS metadata events
+
+    var listenMetadata = function(track) {
+      if (track.kind !== 'metadata') return;
+      track.mode = 'hidden';
+      track.addEventListener('cuechange', function() {
+        player.trigger('metadata', [player, track.activeCues[0].value]);
+      }, false);
+    };
+
+    if (api && api.textTracks && api.textTracks.length) Array.prototype.forEach.call(api.textTracks, listenMetadata);
+    if (api && api.textTracks && typeof api.textTracks.addEventListener === 'function') api.textTracks.addEventListener('addtrack', function(tev) {
+      listenMetadata(tev.track);
+    }, false);
+    if (player.conf.dvr || player.dvr || video.dvr) {
+      bean.on(api, 'progress.dvrhack', function() {
+        if (!api.seekable.length) return;
+        player.video.duration = api.seekable.end(null);
+        player.video.seekOffset = api.seekable.start(null);
+        player.trigger('dvrwindow', [player, {
+          start: api.seekable.start(null),
+          end: api.seekable.end(null)
+        }]);
+        if (api.currentTime >= api.seekable.start(null)) return;
+        api.currentTime = api.seekable.start(null);
+      });
+    }
+
+    Object.keys(EVENTS).forEach(function(type) {
+      var flow = EVENTS[type];
+      if (type === 'webkitendfullscreen' && player.conf.disableInline) flow = 'unload';
+      if (!flow) return;
+      var l = function(e) {
+        video = api.listeners[instanceId];
+        if (!e.target || !common.hasClass(e.target, 'fp-engine')) return;
+
+        if (!/progress/.test(flow)) player.debug(type, '->', flow, e);
+
+        var triggerEvent = function(f) {
+          player.trigger(f || flow, [player, arg]);
+        };
+
+        // no events if player not ready
+        if (!player.ready && !/ready|error/.test(flow) || !flow || !common.find('video', root).length) {
+          if (flow === 'resume') player.one('ready', function() { setTimeout(function() { triggerEvent(); }) });
+          return;
+        }
+        var arg;
+
+        if (flow === 'unload') { //Call player unload
+          player.unload();
+          return;
+        }
+
+        switch (flow) {
+
+        case 'ready':
+          if (player.ready) return player.debug('Player already ready, not sending duplicate ready event');
+          if ((!api.duration || api.duration === Infinity) && !player.live) return player.debug('No duration and VOD setup, not sending ready event');
+          arg = extend(video, {
+            duration: api.duration < Number.MAX_VALUE ? api.duration : 0,
+            width: api.videoWidth,
+            height: api.videoHeight,
+            url: api.currentSrc,
+            src: api.currentSrc,
+          });
+          arg.seekable = arg.duration;
+          player.debug('Ready: ', arg);
+
+          if (!player.live && !arg.duration && !support.hlsDuration && type === 'loadeddata') {
+            var durationChanged = function() {
+              arg.duration = api.duration;
+              try {
+                arg.seekable = api.seekable && api.seekable.end(null);
+
+              } catch (ignored) {}
+              triggerEvent();
+              api.removeEventListener('durationchange', durationChanged);
+              common.toggleClass(root, 'is-live', false);
+            };
+            api.addEventListener('durationchange', durationChanged);
+
+            // Ugly hack to handle broken Android devices
+            var timeUpdated = function() {
+              if (!player.ready && !api.duration) { // No duration even though the video already plays
+                arg.duration = 0;
+                common.addClass(root, 'is-live'); // Make UI believe it's live
+                triggerEvent();
+              }
+              api.removeEventListener('timeupdate', timeUpdated);
+            };
+            api.addEventListener('timeupdate', timeUpdated);
+            return;
+          }
+
+          break;
+
+        case 'progress': case 'seek':
+
+          if (api.currentTime > 0 || player.live) {
+            arg = Math.max(api.currentTime, 0);
+
+          } else if (flow === 'seek' && api.currentTime === 0) {
+            arg = 0;
+          } else if (flow == 'progress') {
+            return;
+          }
+          break;
+
+        case 'buffer':
+          arg = [];
+          for (var i=0; i < api.buffered.length; i++) {
+            arg.push({
+              start: api.buffered.start(i),
+              end: api.buffered.end(i)
+            });
+          }
+          if (api.buffered.length && api.buffered.end(null) === api.duration) triggerEvent('buffered');
+          break;
+
+        case 'speed':
+          arg = round(api.playbackRate);
+          break;
+
+        case 'volume':
+          arg = round(api.muted ? 0 : api.volume);
+          break;
+
+        case 'error':
+          try {
+            arg = (e.srcElement || e.originalTarget).error;
+            arg.video = extend(video, {src: api.src, url: api.src});
+          } catch (er) {
+            // Most likely https://bugzilla.mozilla.org/show_bug.cgi?id=208427
+            return;
+          }
+        }
+
+        triggerEvent();
+
+
+      };
+      root.addEventListener(type, l, true);
+      if (!eventListeners[type]) eventListeners[type] = [];
+      eventListeners[type].push(l);
+
+    });
+    return eventListeners;
+
+  }
+
+}
+
+module.exports = html5factory;
+
+function round(val, per) {
+  per = per || 100;
+  return Math.round(val * per) / per;
+}
+
+function isInViewport(elem) {
+  var rect = elem.getBoundingClientRect();
+
+  return (
+    rect.top >= 0 &&
+    rect.left >= 0 &&
+    rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) + rect.height && /*or $(window).height() */
+    rect.right <= (window.innerWidth || document.documentElement.clientWidth) + rect.width /*or $(window).width() */
+  );
+}
+
+},{"../flowplayer":31}],6:[function(_dereq_,module,exports){
+'use strict';
+var flowplayer = _dereq_('../flowplayer')
+  , common = flowplayer.common
+  , html5factory = _dereq_('./html5-factory');
+
+var VIDEO = document.createElement('video');
 
 function getType(type) {
    return /mpegurl/i.test(type) ? "application/x-mpegurl" : type;
@@ -776,393 +1298,17 @@ function canPlay(type) {
    return !!VIDEO.canPlayType(type).replace("no", '');
 }
 
-function findFromSourcesByType(sources, type) {
-   var arr = sources.filter(function(s) {
-      return s.type === type;
-   });
-   return arr.length ? arr[0] : null;
-}
-
-var videoTagCache;
-var createVideoTag = function(video, autoplay, preload, useCache, inline, subtitles) {
-  if (typeof autoplay === 'undefined') autoplay = true;
-  if (typeof preload === 'undefined') preload = 'none';
-  if (typeof useCache === 'undefined') useCache = true;
-  if (typeof inline === 'undefined') inline = true;
-  if (useCache && videoTagCache) {
-    videoTagCache.type = getType(video.type);
-    videoTagCache.src = video.src;
-    common.find('track', videoTagCache).forEach(common.removeNode);
-    videoTagCache.removeAttribute('crossorigin');
-    return videoTagCache;
-  }
-  var el  = document.createElement('video');
-  el.src = video.src;
-  el.type = getType(video.type);
-  var className = 'fp-engine ';
-  if (subtitles && subtitles.length) className += 'native-subtitles';
-  el.className = className;
-  if (flowplayer.support.autoplay) el.autoplay = autoplay ? 'autoplay' : false;
-  if (flowplayer.support.dataload) el.preload = preload;
-  if (inline) {
-    el.setAttribute('webkit-playsinline', 'true');
-    el.setAttribute('playsinline', 'true');
-  }
-  if (subtitles && subtitles.length) {
-    var setMode = function(mode) {
-      var tracks = el.textTracks;
-      if (!tracks.length) return;
-      tracks[0].mode = mode;
-    };
-    if (subtitles.some(function(st) { return !common.isSameDomain(st.src); })) common.attr(el, 'crossorigin', 'anonymous');
-    if (typeof el.textTracks.addEventListener === 'function') el.textTracks.addEventListener('addtrack', function() {
-      setMode('disabled');
-      setMode('showing');
-    });
-    subtitles.forEach(function(st) {
-      el.appendChild(common.createElement('track', {
-        kind: 'subtitles',
-        srclang: st.srclang || 'en',
-        label: st.label || 'en',
-        src: st.src,
-        'default': st['default']
-      }));
-    });
-  }
-  if (useCache) videoTagCache = el;
-  return el;
-};
-
 var engine;
 
 engine = function(player, root) {
 
-  var api = common.findDirect('video', root)[0] || common.find('.fp-player > video', root)[0],
-      support = flowplayer.support,
-      conf = player.conf,
-      self,
-      timer,
-      lastBuffer,
-      volumeLevel;
-   /*jshint -W093 */
-   return self = {
-      engineName: engine.engineName,
-
-      pick: function(sources) {
-        var source = (function() {
-          if (support.video) {
-            if (conf.videoTypePreference) {
-               var mp4source = findFromSourcesByType(sources, conf.videoTypePreference);
-               if (mp4source) return mp4source;
-            }
-
-            for (var i = 0; i < sources.length; i++) {
-               if (canPlay(sources[i].type)) return sources[i];
-            }
-          }
-        })();
-        if (!source) return;
-        if (typeof source.src === 'string') source.src = common.createAbsoluteUrl(source.src);
-        return source;
-      },
-
-      load: function(video) {
-         var container = common.find('.fp-player', root)[0], reload = false, created = false;
-         if (conf.splash && !api) {
-           api = createVideoTag(
-             video,
-             undefined,
-             undefined,
-             undefined,
-             !conf.disableInline,
-             flowplayer.support.subtitles && conf.nativesubtitles && video.subtitles
-           );
-           common.prepend(container, api);
-           created = true;
-         } else if (!api) {
-           api = createVideoTag(video, !!video.autoplay || !!conf.autoplay, conf.clip.preload || true, false);
-           common.prepend(container, api);
-           created = true;
-         } else {
-           common.addClass(api, 'fp-engine');
-           common.find('source,track', api).forEach(common.removeNode);
-           if (!player.conf.nativesubtitles) common.attr(api, 'crossorigin', false);
-           reload = api.src === video.src;
-         }
-         if (!support.inlineVideo) {
-           common.css(api, {
-             position: 'absolute',
-             top: '-9999em'
-           });
-         }
-         //TODO subtitles support
-
-         // IE does not fire delegated timeupdate events
-         bean.off(api, 'timeupdate', common.noop);
-         bean.on(api, 'timeupdate', common.noop);
-
-         common.prop(api, 'loop', false);
-         player.off('.loophack');
-         if (video.loop || conf.loop) {
-           if (/mpegurl/i.test(video.type)) {
-             player.on('finish.loophack', function() { player.resume(); });
-           }
-           else common.prop(api, 'loop', true);
-         }
-
-         if (typeof volumeLevel !== 'undefined') {
-           api.volume = volumeLevel;
-         }
-
-         if (player.video.src && video.src != player.video.src || video.index) common.attr(api, 'autoplay', 'autoplay');
-         api.src = video.src;
-         api.type = video.type;
-
-         self._listeners = listen(api, common.find("source", api).concat(api), video) || self._listeners;
-
-         if (reload || (created && !conf.splash)) api.load();
-         if (support.iOS.iPad && support.iOS.chrome) api.load();
-         if (api.paused && (video.autoplay || conf.autoplay || conf.splash)) api.play();
-      },
-
-      pause: function() {
-         api.pause();
-      },
-
-      resume: function() {
-         api.play();
-      },
-
-      speed: function(val) {
-         api.playbackRate = val;
-      },
-
-      seek: function(time) {
-         try {
-            var pausedState = player.paused;
-            api.currentTime = time;
-            if (pausedState) api.pause();
-         } catch (ignored) {}
-      },
-
-      volume: function(level) {
-         volumeLevel = level;
-         if (api) {
-            api.volume = level;
-         }
-      },
-
-      unload: function() {
-         common.find('video.fp-engine', root).forEach(function (videoTag) {
-           common.attr(videoTag, 'src', '');
-           common.removeNode(videoTag);
-         });
-         if (!support.cachedVideoTag) videoTagCache = null;
-         timer = clearInterval(timer);
-         var instanceId = root.getAttribute('data-flowplayer-instance-id');
-         delete api.listeners[instanceId];
-         api = 0;
-         if (self._listeners) Object.keys(self._listeners).forEach(function(typ) {
-           self._listeners[typ].forEach(function(l) {
-             root.removeEventListener(typ, l, true);
-           });
-         });
-      }
-
-   };
-
-   function listen(api, sources, video) {
-      // listen only once
-      var instanceId = root.getAttribute('data-flowplayer-instance-id');
-
-      if (api.listeners && api.listeners.hasOwnProperty(instanceId)) {
-        api.listeners[instanceId] = video;
-        return;
-      }
-      (api.listeners || (api.listeners = {}))[instanceId] = video;
-
-      bean.on(sources, 'error', function(e) {
-         try {
-            if (canPlay(e.target.getAttribute('type'))) {
-               player.trigger("error", [player, { code: 4, video: extend(video, {src: api.src, url: api.src}) }]);
-            }
-         } catch (er) {
-            // Most likely: https://bugzilla.mozilla.org/show_bug.cgi?id=208427
-         }
-      });
-
-      player.on('shutdown', function() {
-        bean.off(sources);
-        bean.off(api, '.dvrhack');
-        player.off('.loophack');
-      });
-
-      var eventListeners = {};
-      //Special event handling for HLS metadata events
-
-      var listenMetadata = function(track) {
-        if (track.kind !== 'metadata') return;
-        track.mode = 'hidden';
-        track.addEventListener('cuechange', function() {
-          player.trigger('metadata', [player, track.activeCues[0].value]);
-        }, false);
-      };
-
-      if (api && api.textTracks && api.textTracks.length) Array.prototype.forEach.call(api.textTracks, listenMetadata);
-      if (api && api.textTracks && typeof api.textTracks.addEventListener === 'function') api.textTracks.addEventListener('addtrack', function(tev) {
-        listenMetadata(tev.track);
-      }, false);
-      if (player.conf.dvr || player.dvr || video.dvr) {
-        bean.on(api, 'progress.dvrhack', function() {
-          if (!api.seekable.length) return;
-          player.video.duration = api.seekable.end(null);
-          player.video.seekOffset = api.seekable.start(null);
-          player.trigger('dvrwindow', [player, {
-            start: api.seekable.start(null),
-            end: api.seekable.end(null)
-          }]);
-          if (api.currentTime >= api.seekable.start(null)) return;
-          api.currentTime = api.seekable.start(null);
-        });
-      }
-
-      Object.keys(EVENTS).forEach(function(type) {
-        var flow = EVENTS[type];
-        if (type === 'webkitendfullscreen' && player.conf.disableInline) flow = 'unload';
-        if (!flow) return;
-        var l = function(e) {
-          video = api.listeners[instanceId];
-          if (!e.target || !common.hasClass(e.target, 'fp-engine')) return;
-
-            if (conf.debug && !/progress/.test(flow)) console.log(type, "->", flow, e);
-
-            var triggerEvent = function() {
-              player.trigger(flow, [player, arg]);
-            };
-
-            // no events if player not ready
-            if (!player.ready && !/ready|error/.test(flow) || !flow || !common.find('video', root).length) {
-              if (flow === 'resume') player.one('ready', function() { setTimeout(function() { triggerEvent(); }) });
-              return;
-            }
-            var arg;
-
-            if (flow === 'unload') { //Call player unload
-              player.unload();
-              return;
-            }
-
-            switch (flow) {
-
-               case "ready":
-
-                  arg = extend(video, {
-                     duration: api.duration < Number.MAX_VALUE ? api.duration : 0,
-                     width: api.videoWidth,
-                     height: api.videoHeight,
-                     url: api.currentSrc,
-                     src: api.currentSrc
-                  });
-
-                  try {
-                     arg.seekable = /mpegurl/i.test(video ? (video.type || '') : '') && api.duration || api.seekable && api.seekable.end(null) || player.live;
-
-                  } catch (ignored) {}
-
-                  // buffer
-                  timer = timer || setInterval(function() {
-
-                     try {
-                        arg.buffer = api.buffered.end(null);
-
-                     } catch (ignored) {}
-
-                     if (arg.buffer) {
-                        if (round(arg.buffer, 1000) < round(arg.duration, 1000) && !arg.buffered && arg.buffer !== lastBuffer) {
-                           player.trigger("buffer", [player, arg.buffer]);
-                           lastBuffer = arg.buffer;
-
-                        } else if (!arg.buffered && arg.buffer !== lastBuffer) {
-                           arg.buffered = true;
-                           player.trigger("buffer", [player, arg.buffer]).trigger("buffered", e);
-                           lastBuffer = arg.buffer;
-                           clearInterval(timer);
-                           timer = 0;
-                        }
-                     }
-
-                  }, 250);
-
-                  if (!player.live && !arg.duration && !support.hlsDuration && type === "loadeddata") {
-                     var durationChanged = function() {
-                        arg.duration = api.duration;
-                        try {
-                           arg.seekable = api.seekable && api.seekable.end(null);
-
-                        } catch (ignored) {}
-                        triggerEvent();
-                        api.removeEventListener('durationchange', durationChanged);
-                        common.toggleClass(root, 'is-live', false);
-                     };
-                     api.addEventListener('durationchange', durationChanged);
-
-                     // Ugly hack to handle broken Android devices
-                     var timeUpdated = function() {
-                       if (!player.ready && !api.duration) { // No duration even though the video already plays
-                         arg.duration = 0;
-                         common.addClass(root, 'is-live'); // Make UI believe it's live
-                         triggerEvent();
-                       }
-                       api.removeEventListener('timeupdate', timeUpdated);
-                     };
-                     api.addEventListener('timeupdate', timeUpdated);
-                     return;
-                  }
-
-                  break;
-
-               case "progress": case "seek":
-
-                  if (api.currentTime > 0 || player.live) {
-                     arg = Math.max(api.currentTime, 0);
-
-                  } else if (flow == 'progress') {
-                     return;
-                  }
-                  break;
-
-
-               case "speed":
-                  arg = round(api.playbackRate);
-                  break;
-
-               case "volume":
-                  arg = round(api.volume);
-                  break;
-
-               case "error":
-                  try {
-                     arg = (e.srcElement || e.originalTarget).error;
-                     arg.video = extend(video, {src: api.src, url: api.src});
-                  } catch (er) {
-                     // Most likely https://bugzilla.mozilla.org/show_bug.cgi?id=208427
-                     return;
-                  }
-            }
-
-            triggerEvent();
-
-
-        };
-        root.addEventListener(type, l, true);
-        if (!eventListeners[type]) eventListeners[type] = [];
-        eventListeners[type].push(l);
-
-      });
-      return eventListeners;
-
-   }
-
+  return html5factory('html5', player, root, canPlay, function(video, api) {
+    if (api.currentSrc !== video.src) {
+      common.find('source', api).forEach(common.removeNode);
+      api.src = video.src;
+      api.type = video.type;
+    }
+  });
 };
 
 
@@ -1174,7 +1320,7 @@ engine.engineName = 'html5';
 
 flowplayer.engines.push(engine);
 
-},{"../common":1,"../flowplayer":28,"bean":31,"extend-object":36}],5:[function(_dereq_,module,exports){
+},{"../flowplayer":31,"./html5-factory":5}],7:[function(_dereq_,module,exports){
 'use strict';
 var flowplayer = _dereq_('../flowplayer')
   , common = _dereq_('../common')
@@ -1213,7 +1359,7 @@ flowplayer(function(api, root) {
 
 });
 
-},{"../common":1,"../flowplayer":28,"bean":31}],6:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"bean":34}],8:[function(_dereq_,module,exports){
 'use strict';
 /* global _gat */
 var flowplayer = _dereq_('../flowplayer'),
@@ -1288,7 +1434,7 @@ flowplayer(function(player, root) {
 
 });
 
-},{"../flowplayer":28,"./resolve":19,"bean":31,"scriptjs":42}],7:[function(_dereq_,module,exports){
+},{"../flowplayer":31,"./resolve":21,"bean":34,"scriptjs":45}],9:[function(_dereq_,module,exports){
 /* global chrome */
 /* eslint-disable no-console */
 
@@ -1423,7 +1569,7 @@ flowplayer(function(api, root) {
 
 });
 
-},{"../common":1,"../flowplayer":28,"bean":31,"scriptjs":42}],8:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"bean":34,"scriptjs":45}],10:[function(_dereq_,module,exports){
 'use strict';
 var flowplayer = _dereq_('../flowplayer'),
     common = _dereq_('../common'),
@@ -1543,7 +1689,7 @@ flowplayer(function(player, root) {
 
 });
 
-},{"../common":1,"../flowplayer":28,"bean":31}],9:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"bean":34}],11:[function(_dereq_,module,exports){
 'use strict';
 var flowplayer = _dereq_('../flowplayer'),
     bean = _dereq_('bean'),
@@ -1589,7 +1735,7 @@ flowplayer(function(player, root) {
 
 });
 
-},{"../common":1,"../flowplayer":28,"./util/clipboard":27,"bean":31}],10:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"./util/clipboard":30,"bean":34}],12:[function(_dereq_,module,exports){
 'use strict';
 /**
  * Mimimal jQuery-like event emitter implementation
@@ -1697,7 +1843,7 @@ module.exports.EVENTS = [
   'shutdown'
 ];
 
-},{}],11:[function(_dereq_,module,exports){
+},{}],13:[function(_dereq_,module,exports){
 'use strict';
 
 var flowplayer = _dereq_('../flowplayer')
@@ -1740,7 +1886,7 @@ flowplayer(function(api, root) {
   });
 });
 
-},{"../common":1,"../flowplayer":28,"bean":31}],12:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"bean":34}],14:[function(_dereq_,module,exports){
 'use strict';
 var flowplayer = _dereq_('../flowplayer'),
     bean = _dereq_('bean'),
@@ -1748,10 +1894,7 @@ var flowplayer = _dereq_('../flowplayer'),
    FS_ENTER = "fullscreen",
    FS_EXIT = "fullscreen-exit",
    FULL_PLAYER,
-   FS_SUPPORT = flowplayer.support.fullscreen,
-   ua = navigator.userAgent.toLowerCase(),
-   IS_SAFARI = /(safari)[ \/]([\w.]+)/.exec(ua) && !/(chrome)[ \/]([\w.]+)/.exec(ua);
-
+   FS_SUPPORT = flowplayer.support.fullscreen;
 
 // esc button
 bean.on(document, "fullscreenchange.ffscr webkitfullscreenchange.ffscr mozfullscreenchange.ffscr MSFullscreenChange.ffscr", function(e) {
@@ -1759,7 +1902,7 @@ bean.on(document, "fullscreenchange.ffscr webkitfullscreenchange.ffscr mozfullsc
   if (!FULL_PLAYER && (!el.parentNode || !el.parentNode.getAttribute('data-flowplayer-instance-id'))) return;
   var player = FULL_PLAYER || flowplayer(el.parentNode);
   if (el && !FULL_PLAYER) {
-     FULL_PLAYER = player.trigger(FS_ENTER, [el]);
+     FULL_PLAYER = player.trigger(FS_ENTER, [player]);
   } else {
      FULL_PLAYER.trigger(FS_EXIT, [FULL_PLAYER]);
      FULL_PLAYER = null;
@@ -1800,12 +1943,7 @@ flowplayer(function(player, root) {
             ['requestFullScreen', 'webkitRequestFullScreen', 'mozRequestFullScreen', 'msRequestFullscreen'].forEach(function(fName) {
                if (typeof wrapper[fName] === 'function') {
                  wrapper[fName](Element.ALLOW_KEYBOARD_INPUT);
-                 setTimeout(function() {
-                   if (IS_SAFARI && !document.webkitCurrentFullScreenElement && !document.mozFullScreenElement) { // Element.ALLOW_KEYBOARD_INPUT not allowed
-                     wrapper[fName]();
-                   }
-                 });
-                  return false;
+                 if (fName === 'webkitRequestFullScreen' && !document.webkitFullscreenElement) wrapper[fName]();
                }
             });
 
@@ -1813,7 +1951,6 @@ flowplayer(function(player, root) {
             ['exitFullscreen', 'webkitCancelFullScreen', 'mozCancelFullScreen', 'msExitFullscreen'].forEach(function(fName) {
               if (typeof document[fName] === 'function') {
                 document[fName]();
-                return false;
               }
             });
          }
@@ -1864,7 +2001,7 @@ flowplayer(function(player, root) {
 
 });
 
-},{"../common":1,"../flowplayer":28,"bean":31}],13:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"bean":34}],15:[function(_dereq_,module,exports){
 'use strict';
 var flowplayer = _dereq_('../flowplayer'),
     bean = _dereq_('bean'),
@@ -1930,37 +2067,14 @@ flowplayer(function(api, root) {
    // no keyboard configured
    if (!api.conf.keyboard) return;
 
-   // hover
-   bean.on(root, "mouseenter mouseleave", function(e) {
-      focused = !api.disabled && e.type == 'mouseover' ? api : 0;
+   bean.on(document, 'click', function(ev) {
+      if (common.hasParent(ev.target, root)) {
+         focused = !api.disabled ? api : 0;
+      } else {
+         if (focused !== api) return;
+         focused = 0;
+      }
       if (focused) focusedRoot = root;
-   });
-
-   var speedhelp = flowplayer.support.video && api.conf.engine !== "flash" &&
-      !!document.createElement('video').playbackRate ?
-      '<p><em>shift</em> + <em>&#8592;</em><em>&#8594;</em>slower / faster</p>' : '';
-
-   // TODO: add to player-layout.html
-   root.appendChild(common.createElement('div', { className: 'fp-help' }, '\
-         <a class="fp-close"></a>\
-         <div class="fp-help-section fp-help-basics">\
-            <p><em>space</em>play / pause</p>\
-            <p><em>q</em>unload | stop</p>\
-            <p><em>f</em>fullscreen</p>' + speedhelp + '\
-         </div>\
-         <div class="fp-help-section">\
-            <p><em>&#8593;</em><em>&#8595;</em>volume</p>\
-            <p><em>m</em>mute</p>\
-         </div>\
-         <div class="fp-help-section">\
-            <p><em>&#8592;</em><em>&#8594;</em>seek</p>\
-            <p><em>&nbsp;. </em>seek to previous\
-            </p><p><em>1</em><em>2</em>&hellip; <em>6</em> seek to 10%, 20% &hellip; 60% </p>\
-         </div>\
-   '));
-
-   bean.on(root, 'click', '.fp-close', function() {
-     common.toggleClass(root, IS_HELP);
    });
 
    api.bind('shutdown', function() {
@@ -1970,7 +2084,7 @@ flowplayer(function(api, root) {
 });
 
 
-},{"../common":1,"../flowplayer":28,"bean":31}],14:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"bean":34}],16:[function(_dereq_,module,exports){
 var flowplayer = _dereq_('../flowplayer')
   , common = _dereq_('../common')
   , bean = _dereq_('bean');
@@ -2000,7 +2114,8 @@ flowplayer(function(api, root) {
     if (common.height(menu) + top > common.height(ui)) top = top - common.height(menu);
     common.css(menu, {
       top: top + 'px',
-      left: left + 'px'
+      left: left + 'px',
+      right: 'auto'
     });
   };
 
@@ -2012,7 +2127,7 @@ flowplayer(function(api, root) {
   };
 });
 
-},{"../common":1,"../flowplayer":28,"bean":31}],15:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"bean":34}],17:[function(_dereq_,module,exports){
 var flowplayer = _dereq_('../flowplayer')
   , common = _dereq_('../common')
   , bean = _dereq_('bean');
@@ -2059,27 +2174,30 @@ flowplayer(function(api, root) {
   }
 });
 
-},{"../common":1,"../flowplayer":28,"bean":31}],16:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"bean":34}],18:[function(_dereq_,module,exports){
 'use strict';
 var flowplayer = _dereq_('../flowplayer'),
     isIeMobile = /IEMobile/.test(window.navigator.userAgent),
     common = _dereq_('../common'),
     bean = _dereq_('bean'),
     format = _dereq_('./ui').format,
+    support = flowplayer.support,
     UA = window.navigator.userAgent;
-if (flowplayer.support.touch || isIeMobile) {
+if (support.touch || isIeMobile) {
 
    flowplayer(function(player, root) {
-      var isAndroid = /Android/.test(UA) && !/Firefox/.test(UA) && !/Opera/.test(UA),
+      var android = support.android,
+          isAndroid = android && !android.firefox,
           isSilk = /Silk/.test(UA),
-          androidVer = isAndroid ? parseFloat(/Android\ (\d\.\d)/.exec(UA)[1], 10) : 0;
+          androidVer = android.version || 0;
 
       // custom load for android
       if (isAndroid && !isIeMobile) {
-         if (!/Chrome/.test(UA) && androidVer < 4) {
+         if (!/Chrome/.test(UA) && androidVer < 4 || android.samsung && androidVer < 5) {
             var originalLoad = player.load;
             player.load = function() {
                var ret = originalLoad.apply(player, arguments);
+               common.find('video.fp-engine', root)[0].load();
                player.trigger('ready', [player, player.video]);
                return ret;
             };
@@ -2091,16 +2209,16 @@ if (flowplayer.support.touch || isIeMobile) {
              api.trigger('progress', [api, currentTime]);
            }, 1000);
          };
-         player.bind('ready pause unload', function() {
+         player.on('ready pause unload', function() {
            if (timer) {
              clearInterval(timer);
              timer = null;
            }
          });
-         player.bind('ready', function() {
+         player.on('ready', function() {
            currentTime = 0;
          });
-         player.bind('resume', function(ev, api) {
+         player.on('resume', function(ev, api) {
            if (!api.live) return;
            if (currentTime) { return resumeTimer(api); }
            player.one('progress', function(ev, api, t) {
@@ -2112,8 +2230,12 @@ if (flowplayer.support.touch || isIeMobile) {
       }
 
       // hide volume
-      if (!flowplayer.support.volume) {
+      if (!support.volume) {
+        common.removeClass(root, 'fp-mute');
         common.addClass(root, 'no-volume');
+      }
+      if (support.iOS) {
+         common.addClass(root, 'fp-mute');
       }
       common.addClass(root, 'is-touch');
       if (player.sliders && player.sliders.timeline) player.sliders.timeline.disableAnimation();
@@ -2129,6 +2251,9 @@ if (flowplayer.support.touch || isIeMobile) {
           return;
         }
 
+        var video = common.find('video.fp-engine', root)[0];
+        if (video && video.muted && player.conf.autoplay) video.muted = false;
+
         if (player.playing && !common.hasClass(root, 'is-mouseover')) {
           common.addClass(root, 'is-mouseover');
           common.removeClass(root, 'is-mouseout');
@@ -2140,7 +2265,7 @@ if (flowplayer.support.touch || isIeMobile) {
         if (!player.playing && !player.splash && common.hasClass(root, 'is-mouseout') && !common.hasClass(root, 'is-mouseover')) {
           setTimeout(function() {
             if (!player.disabled && !player.playing && !player.splash) {
-              player.resume();
+              common.find('video.fp-engine', root)[0].play();
             }
           }, 400);
         }
@@ -2149,7 +2274,7 @@ if (flowplayer.support.touch || isIeMobile) {
       });
 
       // native fullscreen
-      if (!flowplayer.support.fullscreen && player.conf.native_fullscreen && typeof document.createElement('video').webkitEnterFullScreen === 'function') {
+      if (!support.fullscreen && player.conf.native_fullscreen && typeof common.createElement('video').webkitEnterFullScreen === 'function') {
          var oldFullscreen = player.fullscreen;
          player.fullscreen = function() {
             var video = common.find('video.fp-engine', root)[0];
@@ -2177,12 +2302,13 @@ if (flowplayer.support.touch || isIeMobile) {
 
       // Android browser gives video.duration == 1 until second 'timeupdate' event
       if (isAndroid || isSilk) player.bind("ready", function() {
-
          var video = common.find('video.fp-engine', root)[0];
-         bean.one(video, 'canplay', function() {
-            video.play();
-         });
-         video.play();
+         if (player.conf.splash && video.paused) {
+            bean.one(video, 'canplay', function() {
+               video.play();
+            });
+            video.load();
+         }
 
          player.bind("progress.dur", function() {
             if (player.live || player.conf.live) return;
@@ -2202,7 +2328,7 @@ if (flowplayer.support.touch || isIeMobile) {
 }
 
 
-},{"../common":1,"../flowplayer":28,"./ui":24,"bean":31}],17:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"./ui":27,"bean":34}],19:[function(_dereq_,module,exports){
 'use strict';
 var flowplayer = _dereq_('../flowplayer'),
     extend = _dereq_('extend-object'),
@@ -2243,7 +2369,7 @@ flowplayer(function(player, root) {
       else if (typeof i != 'number') return player.load.apply(null, arguments);
       var arg = extend({index: i}, player.conf.playlist[i]);
       player.off('beforeresume.fromfirst'); // Don't start from beginning if clip explicitely chosen
-      if (i === player.video.index) return player.load(arg, function() { player.resume(); });
+      if (typeof i === 'number' && i === player.video.index) return player.seek(0, function() { player.resume(); });
       player.load(arg, function() {
         player.video.index = i;
       });
@@ -2290,33 +2416,33 @@ flowplayer(function(player, root) {
    bean.on(root, 'click', '.fp-next', player.next);
    bean.on(root, 'click', '.fp-prev', player.prev);
 
-   if (conf.advance) {
-      player.off("finish.pl").on("finish.pl", function(e, player) {
-         // clip looping
-         if (player.video.loop) return player.seek(0, function() { player.resume(); });
-         // next clip is found or loop
-         var next = player.video.index >= 0 ? player.video.index + 1 : undefined;
-         if (next < player.conf.playlist.length || conf.loop) {
-            next = next === player.conf.playlist.length ? 0 : next;
-            common.removeClass(root, 'is-finished');
-            setTimeout(function() { // Let other finish callbacks fire first
-               player.play(next);
-            });
+   player.off("finish.pl").on("finish.pl", function(e, player) {
+      var advance = typeof player.conf.advance === 'undefined' ? true : player.conf.advance;
+      if (!advance) return;
+      // clip looping
+      if (player.video.loop) return player.seek(0, function() { player.resume(); });
+      // next clip is found or loop
+      var next = player.video.index >= 0 ? player.video.index + 1 : undefined;
+      if (next < player.conf.playlist.length || conf.loop) {
+         next = next === player.conf.playlist.length ? 0 : next;
+         common.removeClass(root, 'is-finished');
+         setTimeout(function() { // Let other finish callbacks fire first
+            player.play(next);
+         });
 
-         // stop to last clip, play button starts from 1:st clip
-         } else {
+      // stop to last clip, play button starts from 1:st clip
+      } else {
 
-            // If we have multiple items in playlist, start from first
-            if (player.conf.playlist.length > 1) {
-              player.one("beforeresume.fromfirst", function(ev) {
-                ev.preventDefault();
-                player.play(0);
-              });
-              player.one('seek', function() { player.off('beforeresume.fromfirst'); });
-            }
+         // If we have multiple items in playlist, start from first
+         if (player.conf.playlist.length > 1) {
+           player.one("beforeresume.fromfirst", function(ev) {
+             ev.preventDefault();
+             player.play(0);
+           });
+           player.one('seek', function() { player.off('beforeresume.fromfirst'); });
          }
-      });
-   }
+      }
+   });
 
    function generatePlaylist() {
       var plEl = common.find('.fp-playlist', root)[0]
@@ -2440,7 +2566,7 @@ flowplayer(function(player, root) {
 
 });
 
-},{"../common":1,"../flowplayer":28,"./resolve":19,"bean":31,"extend-object":36}],18:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"./resolve":21,"bean":34,"extend-object":39}],20:[function(_dereq_,module,exports){
 var flowplayer = _dereq_('../flowplayer')
   , common = _dereq_('../common')
   , bean = _dereq_('bean');
@@ -2505,7 +2631,7 @@ flowplayer(function(api, root) {
 
 });
 
-},{"../common":1,"../flowplayer":28,"bean":31}],19:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"bean":34}],21:[function(_dereq_,module,exports){
 'use strict';
 var TYPE_RE = /\.(\w{3,4})(\?.*)?$/i,
     extend = _dereq_('extend-object');
@@ -2572,7 +2698,7 @@ module.exports = function URLResolver() {
 
 module.exports.TYPE_RE = TYPE_RE;
 
-},{"extend-object":36}],20:[function(_dereq_,module,exports){
+},{"extend-object":39}],22:[function(_dereq_,module,exports){
 'use strict';
 
 var flowplayer = _dereq_('../flowplayer')
@@ -2591,9 +2717,11 @@ flowplayer(function(api, root) {
     if (directEmbed && c.embed && c.embed.iframe) return c.embed.iframe;
     if (typeof api.conf.share === 'string') return api.conf.share;
     var title = encodeURIComponent(api.video.title || (common.find('title')[0] || {}).innerHTML || 'Flowplayer video')
-      , conf = encodeURIComponent(btoa(JSON.stringify(extend({}, api.conf, api.extensions))))
+      , conf = encodeURIComponent(btoa(JSON.stringify(extend({}, api.conf, api.extensions)).replace(/[\u007F-\uFFFF]/g, function(chr) {
+    return "\\u" + ("0000" + chr.charCodeAt(0).toString(16)).substr(-4)
+})))
       , redirect = encodeURIComponent(window.location.toString())
-      , baseUrl = directEmbed ? 'https://flowplayer.org/e/' : 'https://flowplayer.org/s/';
+      , baseUrl = directEmbed ? 'https://flowplayer.com/e/' : 'https://flowplayer.com/s/';
     return baseUrl + '?t=' + title + '&c=' + conf + '&r=' + redirect;
   };
 
@@ -2610,52 +2738,22 @@ flowplayer(function(api, root) {
   });
 });
 
-},{"../common":1,"../flowplayer":28,"bean":31,"extend-object":36}],21:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"bean":34,"extend-object":39}],23:[function(_dereq_,module,exports){
 'use strict';
 var flowplayer = _dereq_('../flowplayer'),
     common = _dereq_('../common'),
-    bean = _dereq_('bean');
+    bean = _dereq_('bean')
+  , parser = _dereq_('./subtitles/parser');
 
-flowplayer.defaults.subtitleParser = function(txt) {
-  var TIMECODE_RE = /^(([0-9]{2}:){1,2}[0-9]{2}[,.][0-9]{3}) --\> (([0-9]{2}:){1,2}[0-9]{2}[,.][0-9]{3})(.*)/;
-
-  function seconds(timecode) {
-     var els = timecode.split(':');
-     if (els.length == 2) els.unshift(0);
-     return els[0] * 60 * 60 + els[1] * 60 + parseFloat(els[2].replace(',','.'));
-  }
-
-  var entries = [];
-  for (var i = 0, lines = txt.split("\n"), len = lines.length, entry = {}, title, timecode, text; i < len; i++) {
-    timecode = TIMECODE_RE.exec(lines[i]);
-
-    if (timecode) {
-
-      // title
-      title = lines[i - 1];
-
-      // text
-      text = "<p>" + lines[++i] + "</p><br/>";
-      while (typeof lines[++i] === 'string' && lines[i].trim() && i < lines.length) text +=  "<p>" + lines[i] + "</p><br/>";
-
-      // entry
-      entry = {
-        title: title,
-        startTime: seconds(timecode[1]),
-        endTime: seconds(timecode[3]),
-        text: text
-      };
-      entries.push(entry);
-    }
-  }
-  return entries;
-};
+flowplayer.defaults.subtitleParser = parser;
 
 flowplayer(function(p, root) {
   var currentPoint, wrap,
       subtitleControl, subtitleMenu;
 
-  if (!flowplayer.support.inlineVideo || p.conf.native_fullscreen) p.conf.nativesubtitles = true;
+  if (
+    !flowplayer.support.inlineVideo ||
+      (!flowplayer.support.fullscreen  && p.conf.native_fullscreen)) p.conf.nativesubtitles = true;
 
   var createSubtitleControl = function() {
     subtitleControl = subtitleControl || common.createElement('strong', { className: 'fp-cc' }, 'CC');
@@ -2694,9 +2792,6 @@ flowplayer(function(p, root) {
 
 
   p.on('ready',  function(ev, player, video) {
-    var conf = player.conf;
-    if (flowplayer.support.subtitles && conf.nativesubtitles && player.engine.engineName == 'html5') return;
-
     player.subtitles = [];
 
     createUIElements();
@@ -2731,13 +2826,15 @@ flowplayer(function(p, root) {
        common.removeClass(wrap, 'fp-shown');
        currentPoint = null;
     }
-    (p.cuepoints || []).forEach(function(cue) {
+    (p.cuepoints || []).forEach(function(cue, index) {
       var entry = cue.subtitle;
       //Trigger cuepoint if start time before seek position and end time nonexistent or in the future
-      if (entry && currentPoint != cue.index) {
+      if (entry && currentPoint != index) {
         if (time >= cue.time && (!entry.endTime || time <= entry.endTime)) p.trigger("cuepoint", [p, cue]);
       } // Also handle cuepoints that act as the removal trigger
-      else if (cue.subtitleEnd && time >= cue.time && cue.index == currentPoint + 1) p.trigger("cuepoint", [p, cue]);
+      else if (cue.subtitleEnd && time >= cue.time && index == currentPoint + 1) {
+        p.trigger("cuepoint", [p, cue]);
+      }
     });
 
   });
@@ -2751,6 +2848,15 @@ flowplayer(function(p, root) {
     common.toggleClass(common.find('a[data-subtitle-index="' + idx + '"]', subtitleMenu)[0], 'fp-selected');
   };
 
+  var setNativeMode = function(i, mode) {
+    var tracks = common.find('video.fp-engine', root)[0].textTracks;
+    if (!tracks.length) return;
+    if (i === null) {
+      [].forEach.call(tracks, function(track) { track.mode = mode; });
+    }
+    else tracks[i].mode = mode;
+  };
+
   p.disableSubtitles = function() {
     p.subtitles = [];
     (p.cuepoints || []).forEach(function(c) {
@@ -2758,6 +2864,9 @@ flowplayer(function(p, root) {
     });
     if (wrap) Array.prototype.forEach.call(wrap.children, common.removeNode);
     setActiveSubtitleClass(-1);
+    if (flowplayer.support.subtitles && p.conf.nativesubtitles && p.engine.engineName == 'html5') {
+      setNativeMode(null, 'disabled');
+    }
     return p;
   };
 
@@ -2770,6 +2879,11 @@ flowplayer(function(p, root) {
     var url = st.src;
     if (!url) return;
     setActiveSubtitleClass(i);
+
+    if (flowplayer.support.subtitles && p.conf.nativesubtitles && p.engine.engineName == 'html5') {
+      setNativeMode(i, 'showing');
+      return;
+    }
     common.xhrGet(url, function(txt) {
       var entries = p.conf.subtitleParser(txt);
       entries.forEach(function(entry) {
@@ -2780,7 +2894,7 @@ flowplayer(function(p, root) {
 
         // initial cuepoint
         if (entry.startTime === 0 && !p.video.time && !p.splash) {
-          p.trigger("cuepoint", [p, cue]);
+          p.trigger("cuepoint", [p, flowplayer.extend({}, cue, { index: 0 })]);
         }
         if (p.splash) p.one('ready', function() { p.trigger('cuepoint', [p, cue]); });
       });
@@ -2793,7 +2907,43 @@ flowplayer(function(p, root) {
 });
 
 
-},{"../common":1,"../flowplayer":28,"bean":31}],22:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"./subtitles/parser":24,"bean":34}],24:[function(_dereq_,module,exports){
+module.exports = function(txt) {
+  var TIMECODE_RE = /^(([0-9]+:){1,2}[0-9]{2}[,.][0-9]{3}) --\> (([0-9]+:){1,2}[0-9]{2}[,.][0-9]{3})(.*)/;
+
+  function seconds(timecode) {
+     var els = timecode.split(':');
+     if (els.length == 2) els.unshift(0);
+     return els[0] * 60 * 60 + els[1] * 60 + parseFloat(els[2].replace(',','.'));
+  }
+
+  var entries = [];
+  for (var i = 0, lines = txt.split("\n"), len = lines.length, entry = {}, title, timecode, text; i < len; i++) {
+    timecode = TIMECODE_RE.exec(lines[i]);
+
+    if (timecode) {
+
+      // title
+      title = lines[i - 1];
+
+      // text
+      text = "<p>" + lines[++i] + "</p><br/>";
+      while (typeof lines[++i] === 'string' && lines[i].trim() && i < lines.length) text +=  "<p>" + lines[i] + "</p><br/>";
+
+      // entry
+      entry = {
+        title: title,
+        startTime: seconds(timecode[1]),
+        endTime: seconds(timecode[3]),
+        text: text
+      };
+      entries.push(entry);
+    }
+  }
+  return entries;
+};
+
+},{}],25:[function(_dereq_,module,exports){
 'use strict';
 /* global ActiveXObject */
 var flowplayer = _dereq_('../flowplayer'),
@@ -2830,6 +2980,8 @@ var flowplayer = _dereq_('../flowplayer'),
       b[match[1]] = true;
       b.version = match[2] || "0";
    }
+   if (b.safari) b.version = (/version\/([\w.]+)/.exec(ua) || [])[1];
+
 
    var video = createVideoTag(),
       UA = navigator.userAgent,
@@ -2837,25 +2989,29 @@ var flowplayer = _dereq_('../flowplayer'),
       IS_IPAD = /iPad|MeeGo/.test(UA) && !/CriOS/.test(UA),
       IS_IPAD_CHROME = /iPad/.test(UA) && /CriOS/.test(UA),
       IS_IPHONE = /iP(hone|od)/i.test(UA) && !/iPad/.test(UA) && !/IEMobile/i.test(UA),
-      IS_ANDROID = /Android/.test(UA) && !/Firefox/.test(UA),
-      IS_ANDROID_FIREFOX = /Android/.test(UA) && /Firefox/.test(UA),
+      IS_ANDROID = /Android/.test(UA),
+      IS_ANDROID_FIREFOX = IS_ANDROID && /Firefox/.test(UA),
+      IS_ANDROID_SAMSUNG = IS_ANDROID && /SAMSUNG/.test(UA),
       IS_SILK = /Silk/.test(UA),
       IS_WP = /IEMobile/.test(UA),
       WP_VER = IS_WP ? parseFloat(/Windows\ Phone\ (\d+\.\d+)/.exec(UA)[1], 10) : 0,
       IE_MOBILE_VER = IS_WP ? parseFloat(/IEMobile\/(\d+\.\d+)/.exec(UA)[1], 10) : 0,
       IOS_VER = IS_IPAD || IS_IPHONE ? parseIOSVersion(UA) : 0,
-      ANDROID_VER = IS_ANDROID ? parseFloat(/Android\ (\d\.\d)/.exec(UA)[1], 10) : 0,
-      s = extend(flowplayer.support, {
+      ANDROID_VER = IS_ANDROID ? parseFloat(/Android\ (\d\.\d)/.exec(UA)[1], 10) : 0;
 
+   var ios = (IS_IPHONE || IS_IPAD || IS_IPAD_CHROME) && {
+     iPhone: IS_IPHONE,
+     iPad: IS_IPAD || IS_IPAD_CHROME,
+     version: IOS_VER,
+     chrome: IS_IPAD_CHROME
+   };
+   var s = extend(flowplayer.support, {
         browser: b,
-        iOS: {
-          iPhone: IS_IPHONE,
-          iPad: IS_IPAD || IS_IPAD_CHROME,
-          version: IOS_VER,
-          chrome: IS_IPAD_CHROME
-        },
+        iOS: ios,
         android: IS_ANDROID ? {
           firefox: IS_ANDROID_FIREFOX,
+          opera: /Opera/.test(UA),
+          samsung: IS_ANDROID_SAMSUNG,
           version: ANDROID_VER
         } : false,
         subtitles: !!video.addTextTrack,
@@ -2871,12 +3027,19 @@ var flowplayer = _dereq_('../flowplayer'),
         zeropreload: !IS_IE && !IS_ANDROID, // IE supports only preload=metadata
         volume: !IS_IPAD && !IS_IPHONE && !IS_SILK && !IS_IPAD_CHROME,
         cachedVideoTag: !IS_IPAD && !IS_IPHONE && !IS_IPAD_CHROME && !IS_WP,
-        firstframe: !IS_IPHONE && !IS_IPAD && !IS_ANDROID && !IS_SILK && !IS_IPAD_CHROME && !IS_WP && !IS_ANDROID_FIREFOX,
+        // iOS < 10 and Samsung support firstframe but not mutedAutoplay
+        // pretend lacking firstframe support because so far we treat
+        // support.autoplay as synonym of support.firstframe
+        firstframe: !IS_SILK && !IS_WP && !IS_ANDROID_FIREFOX && !IS_ANDROID_SAMSUNG && !(IOS_VER && IOS_VER < 10) && !(IS_ANDROID && ANDROID_VER < 4.4),
         inlineVideo: (!IS_IPHONE || IOS_VER >= 10) && (!IS_WP || (WP_VER >= 8.1 && IE_MOBILE_VER >= 11)) && (!IS_ANDROID || ANDROID_VER >= 3),
         hlsDuration: !IS_ANDROID && (!b.safari || IS_IPAD || IS_IPHONE || IS_IPAD_CHROME),
-        seekable: !IS_IPAD && !IS_IPAD_CHROME
+        seekable: !IS_IPAD && !IS_IPAD_CHROME,
+        preloadMetadata: !ios && !b.safari
    });
    s.autoplay = s.firstframe;
+   if (IS_WP) {
+      s.browser.safari = false;
+   }
    // flashVideo
    try {
       var plugin = navigator.plugins["Shockwave Flash"],
@@ -2912,7 +3075,7 @@ var flowplayer = _dereq_('../flowplayer'),
 })();
 
 
-},{"../flowplayer":28,"extend-object":36}],23:[function(_dereq_,module,exports){
+},{"../flowplayer":31,"extend-object":39}],26:[function(_dereq_,module,exports){
 'use strict';
 
 var flowplayer = _dereq_('../flowplayer')
@@ -2957,7 +3120,7 @@ flowplayer(function(api, root) {
   });
 });
 
-},{"../common":1,"../flowplayer":28,"bean":31}],24:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"bean":34}],27:[function(_dereq_,module,exports){
 (function (Buffer){
 'use strict';
 var flowplayer = _dereq_('../flowplayer'),
@@ -3057,7 +3220,6 @@ flowplayer(function(api, root) {
             <a class="fp-icon fp-playbtn"></a>\
             <span class="fp-elapsed">00:00</span>\
             <div class="fp-timeline fp-bar">\
-               <div class="fp-buffer"></div>\
                <span class="fp-timestamp"></span>\
                <div class="fp-progress fp-color"></div>\
             </div>\
@@ -3090,8 +3252,7 @@ flowplayer(function(api, root) {
    }
 
    // widgets
-   var buffer = find("buffer"),
-      waiting = find('waiting'),
+  var waiting = find('waiting'),
       elapsed = find("elapsed"),
       ratio = find("ratio"),
       speedFlash = find('speed-flash'),
@@ -3184,13 +3345,32 @@ flowplayer(function(api, root) {
      common.addClass(play, 'fp-visible');
 
    // buffer
-   }).on("buffer", function() {
+   }).on("buffer", function(ev, api, buffered) {
       var video = api.video,
-         max = video.buffer / video.duration;
+      max = video.buffer / video.duration;
 
       if (!video.seekable && support.seekable) timelineApi.max(api.conf.live ? Infinity : max);
-      if (max < 1) common.css(buffer, "width", (max * 100) + "%");
-      else common.css(buffer, 'width', '100%');
+      if (!buffered || typeof buffered === 'number') { // Legacy
+        buffered = [{
+          start: 0,
+          end: video.buffer
+        }]
+      }
+      var buffers = common.find('.fp-buffer', timeline);
+      if (buffers.length !== buffered.length) {
+        buffers.forEach(common.removeNode);
+        buffers = [];
+      }
+      buffered.forEach(function(b, i) {
+        var buffer = buffers[i] || common.createElement('div', {
+          className: 'fp-buffer'
+        });
+        common.css(buffer, {
+          left: (100 * b.start / video.duration) + '%',
+          width: (100 * (b.end - b.start) / video.duration) + '%'
+        });
+        common.prepend(timeline, buffer);
+      });
    }).on("speed", function(e, api, val) {
      if (api.video.time) {
        common.text(speedFlash, val + "x");
@@ -3211,7 +3391,6 @@ flowplayer(function(api, root) {
      }
 
    }).on("buffered", function() {
-     common.css(buffer, 'width', '100%');
       timelineApi.max(1);
 
    // progress
@@ -3270,10 +3449,14 @@ flowplayer(function(api, root) {
       common.removeClass(root, 'is-seeking');
       common.addClass(root, 'is-error');
       if (error) {
-         error.message = conf.errors[error.code];
          api.error = true;
 
-         var dismiss = api.message((api.engine && api.engine.engineName || 'html5') + ": " + error.message);
+         var code = error.code;
+         if( (error.message || '').match(/DECODER_ERROR_NOT_SUPPORTED/) ) {
+            code = 3;
+         }
+
+         var dismiss = api.message((api.engine && api.engine.engineName || 'html5') + ": " + conf.errors[code] );
          //common.find('p', el)[0].innerHTML = error.url || video.url || video.src || conf.errorUrls[error.code];
          common.removeClass(root, 'is-mouseover');
          api.one('load progress', function() { dismiss(); });
@@ -3349,7 +3532,9 @@ flowplayer(function(api, root) {
      var x = ev.pageX || ev.clientX,
          delta = x - common.offset(timeline).left,
          percentage = delta / common.width(timeline),
-         seconds = (api.rtl ? 1 - percentage : percentage) * api.video.duration;
+         video = api.video,
+         duration = video.duration - (video.seekOffset === undefined ? 0 : video.seekOffset),
+         seconds = (api.rtl ? 1 - percentage : percentage) * duration;
      if (percentage < 0) return;
      common.html(timelineTooltip, format(seconds));
      var left = (delta - common.width(timelineTooltip) / 2);
@@ -3403,7 +3588,7 @@ flowplayer(function(api, root) {
         common.addClass(root, "is-poster");
         common.addClass(play, 'fp-visible');
         api.poster = true;
-        api.one(conf.autoplay ? "progress seek" : "resume seek", function() {
+        api.one(conf.autoplay ? "progress beforeseek" : "resume beforeseek", function() {
           common.removeClass(root, "is-poster");
           common.removeClass(play, 'fp-visible');
           api.poster = false;
@@ -3452,10 +3637,23 @@ flowplayer(function(api, root) {
 
    hover(noToggle);
 
+   var resizeHandle;
+
    api.on('shutdown', function() {
      bean.off(timeline);
      bean.off(volumeSlider);
+     if (resizeHandle) window.cancelAnimationFrame(resizeHandle);
    });
+
+  if (typeof window.requestAnimationFrame === 'function') {
+    var resize = function() {
+      var playerEl = common.find('.fp-player', root)[0] || root;
+      common.toggleClass(root, 'is-tiny', playerEl.clientWidth < 400);
+      common.toggleClass(root, 'is-small', playerEl.clientWidth < 600 && playerEl.clientWidth >= 400);
+      resizeHandle = window.requestAnimationFrame(resize);
+    };
+    resizeHandle = window.requestAnimationFrame(resize);
+  }
 
 });
 
@@ -3463,7 +3661,7 @@ flowplayer(function(api, root) {
 module.exports.format = format;
 
 }).call(this,_dereq_("buffer").Buffer)
-},{"../common":1,"../flowplayer":28,"./ui/bar-slider":25,"./ui/slider":26,"bean":31,"buffer":32}],25:[function(_dereq_,module,exports){
+},{"../common":1,"../flowplayer":31,"./ui/bar-slider":28,"./ui/slider":29,"bean":34,"buffer":35}],28:[function(_dereq_,module,exports){
 var bean = _dereq_('bean')
   , common = _dereq_('../../common');
 
@@ -3533,7 +3731,7 @@ function slider(root, opts) {
 
 module.exports = slider;
 
-},{"../../common":1,"bean":31}],26:[function(_dereq_,module,exports){
+},{"../../common":1,"bean":34}],29:[function(_dereq_,module,exports){
 'use strict';
 // skip IE policies
 // document.ondragstart = function () { return false; };
@@ -3684,7 +3882,7 @@ var slider = function(root, rtl) {
 
 module.exports = slider;
 
-},{"../../common":1,"bean":31}],27:[function(_dereq_,module,exports){
+},{"../../common":1,"bean":34}],30:[function(_dereq_,module,exports){
 
 
 var clipboard = module.exports = function(text, successCallback, errorCallback) {
@@ -3708,7 +3906,7 @@ function doCopy(text) {
   if (!success) throw new Error('Unsuccessfull');
 }
 
-},{}],28:[function(_dereq_,module,exports){
+},{}],31:[function(_dereq_,module,exports){
 'use strict';
 var extend = _dereq_('extend-object'),
     isFunction = _dereq_('is-function'),
@@ -3736,14 +3934,6 @@ window.onbeforeunload = function(ev) {
   if (oldHandler) return oldHandler(ev);
 };
 
-var supportLocalStorage = false;
-try {
-  if (typeof window.localStorage == "object") {
-    window.localStorage.flowplayerTestStorage = "test";
-    supportLocalStorage = true;
-  }
-} catch (ignored) {}
-
 var isSafari = /Safari/.exec(navigator.userAgent) && !/Chrome/.exec(navigator.userAgent),
     m = /(\d+\.\d+) Safari/.exec(navigator.userAgent),
     safariVersion = m ? Number(m[1]) : 100;
@@ -3768,9 +3958,13 @@ var flowplayer = module.exports = function(fn, opts, callback) {
 
 extend(flowplayer, {
 
-   version: '7.0.4',
+   version: '7.2.4',
 
    engines: [],
+
+   engine: function(name) {
+     return flowplayer.engines.filter(function(e) { return e.engineName === name; })[0];
+   },
 
    extensions: [],
 
@@ -3789,7 +3983,7 @@ extend(flowplayer, {
 
    defaults: {
 
-      debug: supportLocalStorage ? !!localStorage.flowplayerDebug : false,
+      debug: false,
 
       // true = forced playback
       disabled: false,
@@ -3810,13 +4004,15 @@ extend(flowplayer, {
 
       hlsQualities: true,
 
+      seekStep: false,
+
       splash: false,
 
       live: false,
       livePositionOffset: 120,
 
-      swf: "//releases.flowplayer.org/7.0.4/flowplayer.swf",
-      swfHls: "//releases.flowplayer.org/7.0.4/flowplayerhls.swf",
+      swf: "//releases.flowplayer.org/7.2.4/flowplayer.swf",
+      swfHls: "//releases.flowplayer.org/7.2.4/flowplayerhls.swf",
 
       speeds: [0.25, 0.5, 1, 1.5, 2],
 
@@ -3824,8 +4020,10 @@ extend(flowplayer, {
 
       mouseoutTimeout: 5000,
 
+      mutedAutoplay: true,
+
       // initial volume level
-      volume: !supportLocalStorage ? 1 : localStorage.muted == "true" ? 0 : !isNaN(localStorage.volume) ? localStorage.volume || 1 : 1,
+      volume: 1,
 
       // http://www.whatwg.org/specs/web-apps/current-work/multipage/the-video-element.html#error-codes
       errors: [
@@ -3891,6 +4089,7 @@ if (typeof window.jQuery !== 'undefined') {
       if (val !== undefined && ['autoplay', 'poster'].indexOf(key) !== -1) conf[key] = val ? val : true;
       else if (val !== undefined) clip[key] = val ? val : true;
     });
+    videoTag[0].autoplay = videoTag[0].preload = false;
     clip.subtitles = videoTag.find('track').map(function() {
       var tr = $(this);
       return {
@@ -3927,6 +4126,16 @@ if (typeof window.jQuery !== 'undefined') {
 function initializePlayer(element, opts, callback) {
   if (opts && opts.embed) opts.embed = extend({}, flowplayer.defaults.embed, opts.embed);
 
+  var supportLocalStorage = false;
+  try {
+    if (typeof flowplayer.conf.storage === 'undefined' && typeof window.localStorage == "object") {
+      window.localStorage.flowplayerTestStorage = "test";
+      supportLocalStorage = true;
+    }
+  } catch (ignored) {}
+
+
+
   var root = element,
       conf = extend({}, flowplayer.defaults, flowplayer.conf, opts),
       storage = {},
@@ -3938,8 +4147,12 @@ function initializePlayer(element, opts, callback) {
       common.toggleClass(root, 'no-flex', !flowplayer.support.flex);
       common.toggleClass(root, 'no-svg', !flowplayer.support.svg);
       try {
-         storage = supportLocalStorage ? window.localStorage : storage;
+         storage = flowplayer.conf.storage || (supportLocalStorage ? window.localStorage : storage);
       } catch(e) {}
+
+      conf.volume = storage.muted === "true" ? 0 : !isNaN(storage.volume) ? storage.volume || conf.volume : conf.volume;
+
+      conf.debug = !!storage.flowplayerDebug || conf.debug;
 
       if (conf.aspectRatio && typeof conf.aspectRatio === 'string') {
         var parts = conf.aspectRatio.split(/[:\/]/);
@@ -3985,6 +4198,10 @@ function initializePlayer(element, opts, callback) {
             } catch (e) { /* */ }
             api.hijacked = false;
          },
+         debug: function() {
+            if (!conf.debug) return;
+            console.log.apply(console, ['DEBUG'].concat([].slice.call(arguments)));
+         },
          load: function(video, callback) {
 
             if (api.error || api.loading) return;
@@ -4023,6 +4240,7 @@ function initializePlayer(element, opts, callback) {
             if (video.src) {
                var e = api.trigger('load', [api, video, engine], true);
                if (!e.defaultPrevented) {
+                  api.ready = false;
                   engine.load(video);
 
                   // callback
@@ -4075,10 +4293,11 @@ function initializePlayer(element, opts, callback) {
          */
          seek: function(time, callback) {
             if (typeof time == "boolean") {
-               var delta = api.video.duration * 0.1;
+               var delta = api.conf.seekStep || api.video.duration * 0.1;
                time = api.video.time + (time ? delta : -delta);
                time = Math.min(Math.max(time, 0), api.video.duration - 0.1);
             }
+            if (typeof time === 'undefined') return api;
             if (api.hijacked) return api.hijacked.seek(time, callback) | api;
             if (api.ready) {
                lastSeekPosition = time;
@@ -4111,12 +4330,16 @@ function initializePlayer(element, opts, callback) {
 
          mute: function(flag, skipStore) {
            if (flag === undefined) flag = !api.muted;
+           api.muted = flag;
            if (!skipStore) {
-             storage.muted = api.muted = flag;
+             storage.muted = flag;
              storage.volume = !isNaN(storage.volume) ? storage.volume : conf.volume; // make sure storage has volume
            }
-           api.volume(flag ? 0 : storage.volume, true);
-           api.trigger("mute", [api, flag]);
+           if (typeof engine.mute !== 'undefined') engine.mute(flag);
+           else {
+             api.volume(flag ? 0 : storage.volume, true);
+             api.trigger("mute", [api, flag]);
+           }
            return api;
          },
 
@@ -4150,9 +4373,13 @@ function initializePlayer(element, opts, callback) {
          stop: function() {
             if (api.ready) {
                api.pause();
-               api.seek(0, function() {
+               if (!api.live || api.dvr) {
+                  api.seek(0, function() {
+                     api.trigger("stop", [api]);
+                  });
+               } else {
                   api.trigger("stop", [api]);
-               });
+               }
             }
             return api;
          },
@@ -4238,11 +4465,13 @@ function initializePlayer(element, opts, callback) {
 
 
          api.on('boot', function() {
+            var support = flowplayer.support;
 
             // splash
-            if (conf.splash || common.hasClass(root, "is-splash") || !flowplayer.support.firstframe) {
+            if (conf.splash || common.hasClass(root, "is-splash") ||
+                  !support.firstframe) {
                api.forcedSplash = !conf.splash && !common.hasClass(root, "is-splash");
-               api.splash = conf.autoplay = true;
+               api.splash = true;
                if (!conf.splash) conf.splash = true;
                common.addClass(root, "is-splash");
             }
@@ -4330,15 +4559,14 @@ function initializePlayer(element, opts, callback) {
 
          }).on("progress", function(e, api, time) {
             api.video.time = time;
-         }).on('buffer', function(e, api, buffer) {
-            api.video.buffer = buffer;
+         }).on('buffer', function(e, api, buffered) {
+            api.video.buffer = typeof buffered === 'number' ? buffered : buffered.length ? buffered[buffered.length - 1].end : 0;
          }).on("speed", function(e, api, val) {
             api.currentSpeed = val;
 
          }).on("volume", function(e, api, level) {
             api.volumeLevel = Math.round(level * 100) / 100;
-            if (!api.muted) storage.volume = level;
-            else if (level) api.mute(false);
+            if (api.muted && level) api.mute(false);
 
 
          }).on("beforeseek seek", function(e) {
@@ -4373,7 +4601,7 @@ function initializePlayer(element, opts, callback) {
   return api;
 }
 
-},{"./common":1,"./ext/events":10,"./ext/resolve":19,"./ext/ui/bar-slider":25,"./ext/ui/slider":26,"bean":31,"extend-object":36,"is-function":39}],29:[function(_dereq_,module,exports){
+},{"./common":1,"./ext/events":12,"./ext/resolve":21,"./ext/ui/bar-slider":28,"./ext/ui/slider":29,"bean":34,"extend-object":39,"is-function":42}],32:[function(_dereq_,module,exports){
 /* eslint-disable no-unused-vars */
 
 //Flowplayer with extensions
@@ -4388,6 +4616,7 @@ _dereq_('./ext/support');
 
 //Engines
 _dereq_('./engine/embed');
+_dereq_('./engine/hlsjs');
 _dereq_('./engine/html5');
 _dereq_('./engine/flash');
 
@@ -4412,10 +4641,10 @@ _dereq_('./ext/menu');
 _dereq_('./ext/fullscreen');
 
 _dereq_('./ext/mobile');
-flowplayer(function(e,o){function a(e){var o=document.createElement("a");return o.href=e,t.hostname(o.hostname)}var l=function(e,o){var a=e.className.split(" ");a.indexOf(o)===-1&&(e.className+=" "+o)},n=function(e){return"none"!==window.getComputedStyle(e).display},r=e.conf,t=flowplayer.common,i=t.createElement,p=r.swf.indexOf("flowplayer.org")&&r.e&&o.getAttribute("data-origin"),s=p?a(p):t.hostname(),d=(document,r.key);if("file:"==location.protocol&&(s="localhost"),e.load.ed=1,r.hostname=s,r.origin=p||location.href,p&&l(o,"is-embedded"),"string"==typeof d&&(d=d.split(/,\s*/)),d&&"function"==typeof key_check&&key_check(d,s)){if(r.logo){var f=t.find(".fp-player",o)[0],c=i("a",{className:"fp-logo"});p&&(c.href=p),r.embed&&r.embed.popup&&(c.target="_blank");var h=i("img",{src:r.logo});c.appendChild(h),(f||o).appendChild(c)}}else{var c=i("a",{href:"https://flowplayer.org/hello"});o.appendChild(c);var y=i("div",{className:"fp-context-menu fp-menu"},'<strong>&copy; 2017 Flowplayer</strong><a href="https://flowplayer.org/hello">About Flowplayer</a><a href="https://flowplayer.org/license">GPL based license</a>'),g=window.location.href.indexOf("localhost"),f=t.find(".fp-player",o)[0];7!==g&&(f||o).appendChild(y),e.on("pause resume finish unload ready",function(e,a){var l=-1;if(a.video.src)for(var r=[["org","flowplayer","drive"],["org","flowplayer","my"],["org","flowplayer","cdn"]],t=0;t<r.length&&(l=a.video.src.indexOf("://"+r[t].reverse().join(".")),l===-1);t++);if(/pause|resume/.test(e.type)&&"flash"!=a.engine.engineName&&4!=l&&5!=l){var i={display:"block",position:"absolute",left:"16px",bottom:"70px",zIndex:99999,width:"100px",height:"20px",backgroundImage:"url("+[".png","logo","/",".net",".cloudfront","d32wqyuo10o653","//"].reverse().join("")+")"};for(var p in i)i.hasOwnProperty(p)&&(c.style[p]=i[p]);a.load.ed=n(c)&&(7===g||y.parentNode==o||y.parentNode==f),a.load.ed||a.pause()}else c.style.display="none"})}});
+flowplayer(function(e,o){function a(e){var o=document.createElement("a");return o.href=e,t.hostname(o.hostname)}var l=function(e,o){var a=e.className.split(" ");-1===a.indexOf(o)&&(e.className+=" "+o)},r=function(e){return"none"!==window.getComputedStyle(e).display},n=e.conf,t=flowplayer.common,p=t.createElement,i=n.swf.indexOf("flowplayer.org")&&n.e&&o.getAttribute("data-origin"),f=i?a(i):t.hostname(),s=(document,n.key);if("file:"==location.protocol&&(f="localhost"),e.load.ed=1,n.hostname=f,n.origin=i||location.href,i&&l(o,"is-embedded"),"string"==typeof s&&(s=s.split(/,\s*/)),s&&"function"==typeof key_check&&key_check(s,f)){if(n.logo){var d=t.find(".fp-player",o)[0],c=n.logo.href||"",h=n.logo.src||n.logo,m=p("a",{className:"fp-logo",href:c});i&&(m.href=m.href||i),n.embed&&n.embed.popup&&(m.target="_blank");var y=p("img",{src:h});m.appendChild(y),(d||o).appendChild(m)}}else{var m=p("a",{href:"https://flowplayer.com/hello/?from=player"}),d=t.find(".fp-player",o)[0];(d||o).appendChild(m);var u=p("div",{className:"fp-context-menu fp-menu"},'<strong>&copy; 2018 Flowplayer AB</strong><a href="https://flowplayer.com/hello/?from=player">About Flowplayer</a><a href="https://flowplayer.com/license">GPL based license</a>'),g=window.location.href.indexOf("localhost");7!==g&&(d||o).appendChild(u),e.on("pause resume finish unload ready",function(e,a){var l=-1;if(a.video.src)for(var n=[["org","flowplayer","drive"],["org","flowplayer","my"],["org","flowplayer","cdn"],["com","flowplayer","cdn"]],t=0;t<n.length&&(l=a.video.src.indexOf("://"+n[t].reverse().join(".")),-1===l);t++);if(/pause|resume/.test(e.type)&&"flash"!=a.engine.engineName&&4!=l&&5!=l){var p={display:"block",position:"absolute",left:"16px",bottom:"70px",zIndex:99999,width:"100px",height:"20px",backgroundImage:"url("+[".png","logo","/",".net",".cloudfront","d32wqyuo10o653","//","https:"].reverse().join("")+")"};for(var i in p)p.hasOwnProperty(i)&&(m.style[i]=p[i]);a.load.ed=r(m)&&(7===g||u.parentNode==o||u.parentNode==d),a.load.ed||a.pause()}else m.style.display="none"})}});
 
 
-},{"./engine/embed":2,"./engine/flash":3,"./engine/html5":4,"./ext/airplay":5,"./ext/analytics":6,"./ext/chromecast":7,"./ext/cuepoint":8,"./ext/embed":9,"./ext/facebook":11,"./ext/fullscreen":12,"./ext/keyboard":13,"./ext/menu":14,"./ext/message":15,"./ext/mobile":16,"./ext/playlist":17,"./ext/qsel":18,"./ext/share":20,"./ext/subtitle":21,"./ext/support":22,"./ext/twitter":23,"./ext/ui":24,"./flowplayer":28,"es5-shim":35}],30:[function(_dereq_,module,exports){
+},{"./engine/embed":2,"./engine/flash":3,"./engine/hlsjs":4,"./engine/html5":6,"./ext/airplay":7,"./ext/analytics":8,"./ext/chromecast":9,"./ext/cuepoint":10,"./ext/embed":11,"./ext/facebook":13,"./ext/fullscreen":14,"./ext/keyboard":15,"./ext/menu":16,"./ext/message":17,"./ext/mobile":18,"./ext/playlist":19,"./ext/qsel":20,"./ext/share":22,"./ext/subtitle":23,"./ext/support":25,"./ext/twitter":26,"./ext/ui":27,"./flowplayer":31,"es5-shim":38}],33:[function(_dereq_,module,exports){
 'use strict'
 
 exports.byteLength = byteLength
@@ -4451,22 +4680,22 @@ function placeHoldersCount (b64) {
 
 function byteLength (b64) {
   // base64 is 4/3 + up to two characters of the original data
-  return b64.length * 3 / 4 - placeHoldersCount(b64)
+  return (b64.length * 3 / 4) - placeHoldersCount(b64)
 }
 
 function toByteArray (b64) {
-  var i, j, l, tmp, placeHolders, arr
+  var i, l, tmp, placeHolders, arr
   var len = b64.length
   placeHolders = placeHoldersCount(b64)
 
-  arr = new Arr(len * 3 / 4 - placeHolders)
+  arr = new Arr((len * 3 / 4) - placeHolders)
 
   // if there are placeholders, only get up to the last complete 4 chars
   l = placeHolders > 0 ? len - 4 : len
 
   var L = 0
 
-  for (i = 0, j = 0; i < l; i += 4, j += 3) {
+  for (i = 0; i < l; i += 4) {
     tmp = (revLookup[b64.charCodeAt(i)] << 18) | (revLookup[b64.charCodeAt(i + 1)] << 12) | (revLookup[b64.charCodeAt(i + 2)] << 6) | revLookup[b64.charCodeAt(i + 3)]
     arr[L++] = (tmp >> 16) & 0xFF
     arr[L++] = (tmp >> 8) & 0xFF
@@ -4531,7 +4760,7 @@ function fromByteArray (uint8) {
   return parts.join('')
 }
 
-},{}],31:[function(_dereq_,module,exports){
+},{}],34:[function(_dereq_,module,exports){
 /*!
   * Bean - copyright (c) Jacob Thornton 2011-2012
   * https://github.com/fat/bean
@@ -5274,7 +5503,7 @@ function fromByteArray (uint8) {
   return bean
 });
 
-},{}],32:[function(_dereq_,module,exports){
+},{}],35:[function(_dereq_,module,exports){
 (function (global){
 /*!
  * The buffer module from node.js, for the browser.
@@ -7067,7 +7296,7 @@ function isnan (val) {
 }
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"base64-js":30,"ieee754":37,"isarray":40}],33:[function(_dereq_,module,exports){
+},{"base64-js":33,"ieee754":40,"isarray":43}],36:[function(_dereq_,module,exports){
 // contains, add, remove, toggle
 var indexof = _dereq_('indexof')
 
@@ -7168,7 +7397,7 @@ function isTruthy(value) {
     return !!value
 }
 
-},{"indexof":38}],34:[function(_dereq_,module,exports){
+},{"indexof":41}],37:[function(_dereq_,module,exports){
 // DEV: We don't use var but favor parameters since these play nicer with minification
 function computedStyle(el, prop, getComputedStyle, style) {
   getComputedStyle = window.getComputedStyle;
@@ -7197,7 +7426,7 @@ function computedStyle(el, prop, getComputedStyle, style) {
 
 module.exports = computedStyle;
 
-},{}],35:[function(_dereq_,module,exports){
+},{}],38:[function(_dereq_,module,exports){
 /*!
  * https://github.com/es-shims/es5-shim
  * @license es5-shim Copyright 2009-2015 by contributors, MIT License
@@ -7540,6 +7769,26 @@ module.exports = computedStyle;
     var toStr = call.bind(ObjectPrototype.toString);
     var arraySlice = call.bind(array_slice);
     var arraySliceApply = apply.bind(array_slice);
+    /* globals document */
+    if (typeof document === 'object' && document && document.documentElement) {
+        try {
+            arraySlice(document.documentElement.childNodes);
+        } catch (e) {
+            var origArraySlice = arraySlice;
+            var origArraySliceApply = arraySliceApply;
+            arraySlice = function arraySliceIE(arr) {
+                var r = [];
+                var i = arr.length;
+                while (i-- > 0) {
+                    r[i] = arr[i];
+                }
+                return origArraySliceApply(r, origArraySlice(arguments, 1));
+            };
+            arraySliceApply = function arraySliceApplyIE(arr, args) {
+                return origArraySliceApply(arraySlice(arr), args);
+            };
+        }
+    }
     var strSlice = call.bind(StringPrototype.slice);
     var strSplit = call.bind(StringPrototype.split);
     var strIndexOf = call.bind(StringPrototype.indexOf);
@@ -8133,10 +8382,14 @@ module.exports = computedStyle;
     var sortIgnoresNonFunctions = (function () {
         try {
             [1, 2].sort(null);
-            [1, 2].sort({});
-            return true;
-        } catch (e) {}
-        return false;
+        } catch (e) {
+            try {
+                [1, 2].sort({});
+            } catch (e2) {
+                return false;
+            }
+        }
+        return true;
     }());
     var sortThrowsOnRegex = (function () {
         // this is a problem in Firefox 4, in which `typeof /a/ === 'function'`
@@ -8175,14 +8428,14 @@ module.exports = computedStyle;
     // http://es5.github.com/#x15.2.3.14
 
     // http://whattheheadsaid.com/2010/10/a-safer-object-keys-compatibility-implementation
-    var hasDontEnumBug = !isEnum({ 'toString': null }, 'toString');
+    var hasDontEnumBug = !isEnum({ 'toString': null }, 'toString'); // jscs:ignore disallowQuotedKeysInObjects
     var hasProtoEnumBug = isEnum(function () {}, 'prototype');
     var hasStringEnumBug = !owns('x', '0');
     var equalsConstructorPrototype = function (o) {
         var ctor = o.constructor;
         return ctor && ctor.prototype === o;
     };
-    var blacklistedKeys = {
+    var excludedKeys = {
         $window: true,
         $console: true,
         $parent: true,
@@ -8192,7 +8445,11 @@ module.exports = computedStyle;
         $frameElement: true,
         $webkitIndexedDB: true,
         $webkitStorageInfo: true,
-        $external: true
+        $external: true,
+        $width: true,
+        $height: true,
+        $top: true,
+        $localStorage: true
     };
     var hasAutomationEqualityBug = (function () {
         /* globals window */
@@ -8201,7 +8458,7 @@ module.exports = computedStyle;
         }
         for (var k in window) {
             try {
-                if (!blacklistedKeys['$' + k] && owns(window, k) && window[k] !== null && typeof window[k] === 'object') {
+                if (!excludedKeys['$' + k] && owns(window, k) && window[k] !== null && typeof window[k] === 'object') {
                     equalsConstructorPrototype(window[k]);
                 }
             } catch (e) {
@@ -8237,12 +8494,12 @@ module.exports = computedStyle;
         return toStr(value) === '[object Arguments]';
     };
     var isLegacyArguments = function isArguments(value) {
-        return value !== null &&
-            typeof value === 'object' &&
-            typeof value.length === 'number' &&
-            value.length >= 0 &&
-            !isArray(value) &&
-            isCallable(value.callee);
+        return value !== null
+            && typeof value === 'object'
+            && typeof value.length === 'number'
+            && value.length >= 0
+            && !isArray(value)
+            && isCallable(value.callee);
     };
     var isArguments = isStandardArguments(arguments) ? isStandardArguments : isLegacyArguments;
 
@@ -8319,10 +8576,10 @@ module.exports = computedStyle;
     var timeZoneOffset = aNegativeTestDate.getTimezoneOffset();
     if (timeZoneOffset < -720) {
         hasToDateStringFormatBug = aNegativeTestDate.toDateString() !== 'Tue Jan 02 -45875';
-        hasToStringFormatBug = !(/^Thu Dec 10 2015 \d\d:\d\d:\d\d GMT[-\+]\d\d\d\d(?: |$)/).test(aPositiveTestDate.toString());
+        hasToStringFormatBug = !(/^Thu Dec 10 2015 \d\d:\d\d:\d\d GMT[-+]\d\d\d\d(?: |$)/).test(String(aPositiveTestDate));
     } else {
         hasToDateStringFormatBug = aNegativeTestDate.toDateString() !== 'Mon Jan 01 -45875';
-        hasToStringFormatBug = !(/^Wed Dec 09 2015 \d\d:\d\d:\d\d GMT[-\+]\d\d\d\d(?: |$)/).test(aPositiveTestDate.toString());
+        hasToStringFormatBug = !(/^Wed Dec 09 2015 \d\d:\d\d:\d\d GMT[-+]\d\d\d\d(?: |$)/).test(String(aPositiveTestDate));
     }
 
     var originalGetFullYear = call.bind(Date.prototype.getFullYear);
@@ -8431,13 +8688,13 @@ module.exports = computedStyle;
             var hour = originalGetUTCHours(this);
             var minute = originalGetUTCMinutes(this);
             var second = originalGetUTCSeconds(this);
-            return dayName[day] + ', ' +
-                (date < 10 ? '0' + date : date) + ' ' +
-                monthName[month] + ' ' +
-                year + ' ' +
-                (hour < 10 ? '0' + hour : hour) + ':' +
-                (minute < 10 ? '0' + minute : minute) + ':' +
-                (second < 10 ? '0' + second : second) + ' GMT';
+            return dayName[day] + ', '
+                + (date < 10 ? '0' + date : date) + ' '
+                + monthName[month] + ' '
+                + year + ' '
+                + (hour < 10 ? '0' + hour : hour) + ':'
+                + (minute < 10 ? '0' + minute : minute) + ':'
+                + (second < 10 ? '0' + second : second) + ' GMT';
         }
     }, hasNegativeMonthYearBug || hasToUTCStringFormatBug);
 
@@ -8451,10 +8708,10 @@ module.exports = computedStyle;
             var date = this.getDate();
             var month = this.getMonth();
             var year = this.getFullYear();
-            return dayName[day] + ' ' +
-                monthName[month] + ' ' +
-                (date < 10 ? '0' + date : date) + ' ' +
-                year;
+            return dayName[day] + ' '
+                + monthName[month] + ' '
+                + (date < 10 ? '0' + date : date) + ' '
+                + year;
         }
     }, hasNegativeMonthYearBug || hasToDateStringFormatBug);
 
@@ -8474,16 +8731,16 @@ module.exports = computedStyle;
             var timezoneOffset = this.getTimezoneOffset();
             var hoursOffset = Math.floor(Math.abs(timezoneOffset) / 60);
             var minutesOffset = Math.floor(Math.abs(timezoneOffset) % 60);
-            return dayName[day] + ' ' +
-                monthName[month] + ' ' +
-                (date < 10 ? '0' + date : date) + ' ' +
-                year + ' ' +
-                (hour < 10 ? '0' + hour : hour) + ':' +
-                (minute < 10 ? '0' + minute : minute) + ':' +
-                (second < 10 ? '0' + second : second) + ' GMT' +
-                (timezoneOffset > 0 ? '-' : '+') +
-                (hoursOffset < 10 ? '0' + hoursOffset : hoursOffset) +
-                (minutesOffset < 10 ? '0' + minutesOffset : minutesOffset);
+            return dayName[day] + ' '
+                + monthName[month] + ' '
+                + (date < 10 ? '0' + date : date) + ' '
+                + year + ' '
+                + (hour < 10 ? '0' + hour : hour) + ':'
+                + (minute < 10 ? '0' + minute : minute) + ':'
+                + (second < 10 ? '0' + second : second) + ' GMT'
+                + (timezoneOffset > 0 ? '-' : '+')
+                + (hoursOffset < 10 ? '0' + hoursOffset : hoursOffset)
+                + (minutesOffset < 10 ? '0' + minutesOffset : minutesOffset);
         };
         if (supportsDescriptors) {
             $Object.defineProperty(Date.prototype, 'toString', {
@@ -8503,7 +8760,7 @@ module.exports = computedStyle;
     // this object is not a finite Number a RangeError exception is thrown.
     var negativeDate = -62198755200000;
     var negativeYearString = '-000001';
-    var hasNegativeDateBug = Date.prototype.toISOString && new Date(negativeDate).toISOString().indexOf(negativeYearString) === -1;
+    var hasNegativeDateBug = Date.prototype.toISOString && new Date(negativeDate).toISOString().indexOf(negativeYearString) === -1; // eslint-disable-line max-len
     var hasSafari51DateBug = Date.prototype.toISOString && new Date(-1).toISOString() !== '1969-12-31T23:59:59.999Z';
 
     var getTime = call.bind(Date.prototype.getTime);
@@ -8520,13 +8777,19 @@ module.exports = computedStyle;
             var month = originalGetUTCMonth(this);
             // see https://github.com/es-shims/es5-shim/issues/111
             year += Math.floor(month / 12);
-            month = (month % 12 + 12) % 12;
+            month = ((month % 12) + 12) % 12;
 
             // the date time string format is specified in 15.9.1.15.
-            var result = [month + 1, originalGetUTCDate(this), originalGetUTCHours(this), originalGetUTCMinutes(this), originalGetUTCSeconds(this)];
+            var result = [
+                month + 1,
+                originalGetUTCDate(this),
+                originalGetUTCHours(this),
+                originalGetUTCMinutes(this),
+                originalGetUTCSeconds(this)
+            ];
             year = (
-                (year < 0 ? '-' : (year > 9999 ? '+' : '')) +
-                strSlice('00000' + Math.abs(year), (0 <= year && year <= 9999) ? -4 : -6)
+                (year < 0 ? '-' : (year > 9999 ? '+' : ''))
+                + strSlice('00000' + Math.abs(year), (0 <= year && year <= 9999) ? -4 : -6)
             );
 
             for (var i = 0; i < result.length; ++i) {
@@ -8535,9 +8798,9 @@ module.exports = computedStyle;
             }
             // pad milliseconds to have three digits.
             return (
-                year + '-' + arraySlice(result, 0, 2).join('-') +
-                'T' + arraySlice(result, 2).join(':') + '.' +
-                strSlice('000' + originalGetUTCMilliseconds(this), -3) + 'Z'
+                year + '-' + arraySlice(result, 0, 2).join('-')
+                + 'T' + arraySlice(result, 2).join(':') + '.'
+                + strSlice('000' + originalGetUTCMilliseconds(this), -3) + 'Z'
             );
         }
     }, hasNegativeDateBug || hasSafari51DateBug);
@@ -8548,10 +8811,10 @@ module.exports = computedStyle;
     // JSON.stringify (15.12.3).
     var dateToJSONIsSupported = (function () {
         try {
-            return Date.prototype.toJSON &&
-                new Date(NaN).toJSON() === null &&
-                new Date(negativeDate).toJSON().indexOf(negativeYearString) !== -1 &&
-                Date.prototype.toJSON.call({ // generic
+            return Date.prototype.toJSON
+                && new Date(NaN).toJSON() === null
+                && new Date(negativeDate).toJSON().indexOf(negativeYearString) !== -1
+                && Date.prototype.toJSON.call({ // generic
                     toISOString: function () { return true; }
                 });
         } catch (e) {
@@ -8605,13 +8868,10 @@ module.exports = computedStyle;
         // XXX global assignment won't work in embeddings that use
         // an alternate object for the context.
         /* global Date: true */
-        /* eslint-disable no-undef */
         var maxSafeUnsigned32Bit = Math.pow(2, 31) - 1;
         var hasSafariSignedIntBug = isActualNaN(new Date(1970, 0, 1, 0, 0, 0, maxSafeUnsigned32Bit + 1).getTime());
-        /* eslint-disable no-implicit-globals */
+        // eslint-disable-next-line no-implicit-globals, no-global-assign
         Date = (function (NativeDate) {
-        /* eslint-enable no-implicit-globals */
-        /* eslint-enable no-undef */
             // Date.length === 7
             var DateShim = function Date(Y, M, D, h, m, s, ms) {
                 var length = arguments.length;
@@ -8626,19 +8886,19 @@ module.exports = computedStyle;
                         seconds += sToShift;
                         millis -= sToShift * 1e3;
                     }
-                    date = length === 1 && $String(Y) === Y ? // isString(Y)
+                    date = length === 1 && $String(Y) === Y // isString(Y)
                         // We explicitly pass it through parse:
-                        new NativeDate(DateShim.parse(Y)) :
+                        ? new NativeDate(DateShim.parse(Y))
                         // We have to manually make calls depending on argument
                         // length here
-                        length >= 7 ? new NativeDate(Y, M, D, h, m, seconds, millis) :
-                        length >= 6 ? new NativeDate(Y, M, D, h, m, seconds) :
-                        length >= 5 ? new NativeDate(Y, M, D, h, m) :
-                        length >= 4 ? new NativeDate(Y, M, D, h) :
-                        length >= 3 ? new NativeDate(Y, M, D) :
-                        length >= 2 ? new NativeDate(Y, M) :
-                        length >= 1 ? new NativeDate(Y instanceof NativeDate ? +Y : Y) :
-                                      new NativeDate();
+                        : length >= 7 ? new NativeDate(Y, M, D, h, m, seconds, millis)
+                            : length >= 6 ? new NativeDate(Y, M, D, h, m, seconds)
+                                : length >= 5 ? new NativeDate(Y, M, D, h, m)
+                                    : length >= 4 ? new NativeDate(Y, M, D, h)
+                                        : length >= 3 ? new NativeDate(Y, M, D)
+                                            : length >= 2 ? new NativeDate(Y, M)
+                                                : length >= 1 ? new NativeDate(Y instanceof NativeDate ? +Y : Y)
+                                                    : new NativeDate();
                 } else {
                     date = NativeDate.apply(this, arguments);
                 }
@@ -8650,38 +8910,37 @@ module.exports = computedStyle;
             };
 
             // 15.9.1.15 Date Time String Format.
-            var isoDateExpression = new RegExp('^' +
-                '(\\d{4}|[+-]\\d{6})' + // four-digit year capture or sign +
-                                          // 6-digit extended year
-                '(?:-(\\d{2})' + // optional month capture
-                '(?:-(\\d{2})' + // optional day capture
-                '(?:' + // capture hours:minutes:seconds.milliseconds
-                    'T(\\d{2})' + // hours capture
-                    ':(\\d{2})' + // minutes capture
-                    '(?:' + // optional :seconds.milliseconds
-                        ':(\\d{2})' + // seconds capture
-                        '(?:(\\.\\d{1,}))?' + // milliseconds capture
-                    ')?' +
-                '(' + // capture UTC offset component
-                    'Z|' + // UTC capture
-                    '(?:' + // offset specifier +/-hours:minutes
-                        '([-+])' + // sign capture
-                        '(\\d{2})' + // hours offset capture
-                        ':(\\d{2})' + // minutes offset capture
-                    ')' +
-                ')?)?)?)?' +
-            '$');
+            var isoDateExpression = new RegExp('^'
+                + '(\\d{4}|[+-]\\d{6})' // four-digit year capture or sign + 6-digit extended year
+                + '(?:-(\\d{2})' // optional month capture
+                + '(?:-(\\d{2})' // optional day capture
+                + '(?:' // capture hours:minutes:seconds.milliseconds
+                    + 'T(\\d{2})' // hours capture
+                    + ':(\\d{2})' // minutes capture
+                    + '(?:' // optional :seconds.milliseconds
+                        + ':(\\d{2})' // seconds capture
+                        + '(?:(\\.\\d{1,}))?' // milliseconds capture
+                    + ')?'
+                + '(' // capture UTC offset component
+                    + 'Z|' // UTC capture
+                    + '(?:' // offset specifier +/-hours:minutes
+                        + '([-+])' // sign capture
+                        + '(\\d{2})' // hours offset capture
+                        + ':(\\d{2})' // minutes offset capture
+                    + ')'
+                + ')?)?)?)?'
+            + '$');
 
             var months = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365];
 
             var dayFromMonth = function dayFromMonth(year, month) {
                 var t = month > 1 ? 1 : 0;
                 return (
-                    months[month] +
-                    Math.floor((year - 1969 + t) / 4) -
-                    Math.floor((year - 1901 + t) / 100) +
-                    Math.floor((year - 1601 + t) / 400) +
-                    365 * (year - 1970)
+                    months[month]
+                    + Math.floor((year - 1969 + t) / 4)
+                    - Math.floor((year - 1901 + t) / 100)
+                    + Math.floor((year - 1601 + t) / 400)
+                    + (365 * (year - 1970))
                 );
             };
 
@@ -8711,9 +8970,7 @@ module.exports = computedStyle;
                 UTC: NativeDate.UTC
             }, true);
             DateShim.prototype = NativeDate.prototype;
-            defineProperties(DateShim.prototype, {
-                constructor: DateShim
-            }, true);
+            defineProperties(DateShim.prototype, { constructor: DateShim }, true);
 
             // Upgrade Date.parse to handle simplified ISO 8601 strings
             var parseShim = function parse(string) {
@@ -8739,22 +8996,22 @@ module.exports = computedStyle;
                         result;
                     var hasMinutesOrSecondsOrMilliseconds = minute > 0 || second > 0 || millisecond > 0;
                     if (
-                        hour < (hasMinutesOrSecondsOrMilliseconds ? 24 : 25) &&
-                        minute < 60 && second < 60 && millisecond < 1000 &&
-                        month > -1 && month < 12 && hourOffset < 24 &&
-                        minuteOffset < 60 && // detect invalid offsets
-                        day > -1 &&
-                        day < (dayFromMonth(year, month + 1) - dayFromMonth(year, month))
+                        hour < (hasMinutesOrSecondsOrMilliseconds ? 24 : 25)
+                        && minute < 60 && second < 60 && millisecond < 1000
+                        && month > -1 && month < 12 && hourOffset < 24
+                        && minuteOffset < 60 // detect invalid offsets
+                        && day > -1
+                        && day < (dayFromMonth(year, month + 1) - dayFromMonth(year, month))
                     ) {
                         result = (
-                            (dayFromMonth(year, month) + day) * 24 +
-                            hour +
-                            hourOffset * signOffset
+                            ((dayFromMonth(year, month) + day) * 24)
+                            + hour
+                            + (hourOffset * signOffset)
                         ) * 60;
-                        result = (
-                            (result + minute + minuteOffset * signOffset) * 60 +
-                            second
-                        ) * 1000 + millisecond;
+                        result = ((
+                            ((result + minute + (minuteOffset * signOffset)) * 60)
+                            + second
+                        ) * 1000) + millisecond;
                         if (isLocalTime) {
                             result = toUTC(result);
                         }
@@ -8789,10 +9046,10 @@ module.exports = computedStyle;
     // ES5.1 15.7.4.5
     // http://es5.github.com/#x15.7.4.5
     var hasToFixedBugs = NumberPrototype.toFixed && (
-      (0.00008).toFixed(3) !== '0.000' ||
-      (0.9).toFixed(0) !== '1' ||
-      (1.255).toFixed(2) !== '1.25' ||
-      (1000000000000000128).toFixed(0) !== '1000000000000000128'
+        (0.00008).toFixed(3) !== '0.000'
+        || (0.9).toFixed(0) !== '1'
+        || (1.255).toFixed(2) !== '1.25'
+        || (1000000000000000128).toFixed(0) !== '1000000000000000128'
     );
 
     var toFixedHelpers = {
@@ -8970,12 +9227,12 @@ module.exports = computedStyle;
     //    '.'.split(/()()/) should be ["."], not ["", "", "."]
 
     if (
-        'ab'.split(/(?:ab)*/).length !== 2 ||
-        '.'.split(/(.?)(.?)/).length !== 4 ||
-        'tesst'.split(/(s)*/)[1] === 't' ||
-        'test'.split(/(?:)/, -1).length !== 4 ||
-        ''.split(/.?/).length ||
-        '.'.split(/()()/).length > 1
+        'ab'.split(/(?:ab)*/).length !== 2
+        || '.'.split(/(.?)(.?)/).length !== 4
+        || 'tesst'.split(/(s)*/)[1] === 't'
+        || 'test'.split(/(?:)/, -1).length !== 4
+        || ''.split(/.?/).length
+        || '.'.split(/()()/).length > 1
     ) {
         (function () {
             var compliantExecNpcg = typeof (/()??/).exec('')[1] === 'undefined'; // NPCG: nonparticipating capturing group
@@ -8993,10 +9250,10 @@ module.exports = computedStyle;
                 }
 
                 var output = [];
-                var flags = (separator.ignoreCase ? 'i' : '') +
-                            (separator.multiline ? 'm' : '') +
-                            (separator.unicode ? 'u' : '') + // in ES6
-                            (separator.sticky ? 'y' : ''), // Firefox 3+ and ES6
+                var flags = (separator.ignoreCase ? 'i' : '')
+                            + (separator.multiline ? 'm' : '')
+                            + (separator.unicode ? 'u' : '') // in ES6
+                            + (separator.sticky ? 'y' : ''), // Firefox 3+ and ES6
                     lastLastIndex = 0,
                     // Make `global` and avoid `lastIndex` issues by working with a copy
                     separator2, match, lastIndex, lastLength;
@@ -9121,9 +9378,9 @@ module.exports = computedStyle;
 
     // ES5 15.5.4.20
     // whitespace from: http://es5.github.io/#x15.5.4.20
-    var ws = '\x09\x0A\x0B\x0C\x0D\x20\xA0\u1680\u180E\u2000\u2001\u2002\u2003' +
-        '\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u202F\u205F\u3000\u2028' +
-        '\u2029\uFEFF';
+    var ws = '\x09\x0A\x0B\x0C\x0D\x20\xA0\u1680\u180E\u2000\u2001\u2002\u2003'
+        + '\u2004\u2005\u2006\u2007\u2008\u2009\u200A\u202F\u205F\u3000\u2028'
+        + '\u2029\uFEFF';
     var zeroWidth = '\u200b';
     var wsRegexChars = '[' + ws + ']';
     var trimBeginRegexp = new RegExp('^' + wsRegexChars + wsRegexChars + '*');
@@ -9173,13 +9430,18 @@ module.exports = computedStyle;
     }, StringPrototype.lastIndexOf.length !== 1);
 
     // ES-5 15.1.2.2
-    /* eslint-disable radix */
+    // eslint-disable-next-line radix
     if (parseInt(ws + '08') !== 8 || parseInt(ws + '0x16') !== 22) {
-    /* eslint-enable radix */
         /* global parseInt: true */
         parseInt = (function (origParseInt) {
-            var hexRegex = /^[\-+]?0[xX]/;
+            var hexRegex = /^[-+]?0[xX]/;
             return function parseInt(str, radix) {
+                if (typeof str === 'symbol') {
+                    // handle Symbols in node 8.3/8.4
+                    // eslint-disable-next-line no-implicit-coercion, no-unused-expressions
+                    '' + str; // jscs:ignore disallowImplicitTypeConversion
+                }
+
                 var string = trim(String(str));
                 var defaultedRadix = $Number(radix) || (hexRegex.test(string) ? 16 : 10);
                 return origParseInt(string, defaultedRadix);
@@ -9264,7 +9526,7 @@ module.exports = computedStyle;
     }
 }));
 
-},{}],36:[function(_dereq_,module,exports){
+},{}],39:[function(_dereq_,module,exports){
 var arr = [];
 var each = arr.forEach;
 var slice = arr.slice;
@@ -9281,7 +9543,7 @@ module.exports = function(obj) {
     return obj;
 };
 
-},{}],37:[function(_dereq_,module,exports){
+},{}],40:[function(_dereq_,module,exports){
 exports.read = function (buffer, offset, isLE, mLen, nBytes) {
   var e, m
   var eLen = nBytes * 8 - mLen - 1
@@ -9367,7 +9629,7 @@ exports.write = function (buffer, value, offset, isLE, mLen, nBytes) {
   buffer[offset + i - d] |= s * 128
 }
 
-},{}],38:[function(_dereq_,module,exports){
+},{}],41:[function(_dereq_,module,exports){
 
 var indexOf = [].indexOf;
 
@@ -9378,7 +9640,7 @@ module.exports = function(arr, obj){
   }
   return -1;
 };
-},{}],39:[function(_dereq_,module,exports){
+},{}],42:[function(_dereq_,module,exports){
 module.exports = isFunction
 
 var toString = Object.prototype.toString
@@ -9395,14 +9657,14 @@ function isFunction (fn) {
       fn === window.prompt))
 };
 
-},{}],40:[function(_dereq_,module,exports){
+},{}],43:[function(_dereq_,module,exports){
 var toString = {}.toString;
 
 module.exports = Array.isArray || function (arr) {
   return toString.call(arr) == '[object Array]';
 };
 
-},{}],41:[function(_dereq_,module,exports){
+},{}],44:[function(_dereq_,module,exports){
 (function (global){
 /*! https://mths.be/punycode v1.4.1 by @mathias */
 ;(function(root) {
@@ -9939,7 +10201,7 @@ module.exports = Array.isArray || function (arr) {
 }(this));
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],42:[function(_dereq_,module,exports){
+},{}],45:[function(_dereq_,module,exports){
 /*!
   * $script.js JS loader & dependency manager
   * https://github.com/ded/script.js
@@ -10064,5 +10326,5 @@ module.exports = Array.isArray || function (arr) {
   return $script
 });
 
-},{}]},{},[29])(29)
+},{}]},{},[32])(32)
 });

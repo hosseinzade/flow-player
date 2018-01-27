@@ -29,9 +29,7 @@
             extend = flowplayer.extend,
             support = flowplayer.support,
             brwsr = support.browser,
-            desktopSafari = brwsr.safari && support.dataload,
-            androidChrome = (support.android && !support.android.firefox) ||
-                    (!support.firstframe && support.dataload && !brwsr.mozilla),
+            version = flowplayer.version,
             win = window,
             mse = win.MediaSource || win.WebKitMediaSource,
             performance = win.performance,
@@ -45,6 +43,19 @@
                 return support.inlineVideo &&
                         (hlsQualities === true ||
                         (hlsQualities && hlsQualities.length));
+            },
+            destroyVideoTag = function (root) {
+                var vtag = common.findDirect("video", root)[0]
+                        || common.find(".fp-player>video", root)[0];
+
+                if (vtag) {
+                    common.find("source", vtag).forEach(function (source) {
+                        source.removeAttribute("src");
+                    });
+                    vtag.removeAttribute("src");
+                    vtag.load();
+                    common.removeNode(vtag);
+                }
             },
 
             engineImpl = function hlsjsEngine(player, root) {
@@ -225,12 +236,7 @@
                             var conf = player.conf,
                                 EVENTS = {
                                     ended: "finish",
-                                    loadeddata: !desktopSafari
-                                        ? "ready"
-                                        : 0,
-                                    canplaythrough: desktopSafari
-                                        ? "ready"
-                                        : 0,
+                                    loadeddata: "ready",
                                     pause: "pause",
                                     play: "resume",
                                     progress: "buffer",
@@ -241,7 +247,7 @@
                                     error: "error"
                                 },
                                 HLSEVENTS = Hls.Events,
-                                autoplay = !!video.autoplay || !!conf.autoplay,
+                                autoplay = !!video.autoplay || !!conf.autoplay || !!conf.splash,
                                 hlsQualitiesConf = video.hlsQualities || conf.hlsQualities,
                                 hlsUpdatedConf = extend(hlsconf, conf.hlsjs, video.hlsjs),
                                 hlsClientConf = extend({}, hlsUpdatedConf);
@@ -252,20 +258,7 @@
                             }
 
                             if (!hls) {
-                                videoTag = common.findDirect("video", root)[0]
-                                        || common.find(".fp-player > video", root)[0];
-
-                                if (videoTag) {
-                                    // destroy video tag
-                                    // otherwise <video autoplay> continues to play
-                                    common.find("source", videoTag).forEach(function (source) {
-                                        source.removeAttribute("src");
-                                    });
-                                    videoTag.removeAttribute("src");
-                                    videoTag.load();
-                                    common.removeNode(videoTag);
-                                }
-
+                                destroyVideoTag(root);
                                 videoTag = common.createElement("video", {
                                     "class": "fp-engine " + engineName + "-engine",
                                     "autoplay": autoplay
@@ -273,6 +266,9 @@
                                         : false,
                                     "volume": player.volumeLevel
                                 });
+                                if (support.mutedAutoplay && !conf.splash && autoplay) {
+                                    videoTag.muted = true;
+                                }
 
                                 Object.keys(EVENTS).forEach(function (key) {
                                     var flow = EVENTS[key],
@@ -287,8 +283,11 @@
                                         var ct = videoTag.currentTime,
                                             seekable = videoTag.seekable,
                                             updatedVideo = player.video,
-                                            seekOffset = updatedVideo.seekOffset,
-                                            liveSyncPosition = player.live && hls.liveSyncPosition,
+                                            liveResumePosition = player.dvr
+                                                ? updatedVideo.seekOffset
+                                                : player.live
+                                                    ? hls.liveSyncPosition
+                                                    : 0,
                                             buffered = videoTag.buffered,
                                             i,
                                             buffends = [],
@@ -309,6 +308,9 @@
                                             if (!hlsUpdatedConf.bufferWhilePaused) {
                                                 hls.startLoad(ct);
                                             }
+                                            if (ct < liveResumePosition) {
+                                                videoTag.currentTime = liveResumePosition;
+                                            }
                                             break;
                                         case "seek":
                                             if (!hlsUpdatedConf.bufferWhilePaused && videoTag.paused) {
@@ -322,18 +324,6 @@
                                             }
                                             break;
                                         case "progress":
-                                            if (liveSyncPosition) {
-                                                updatedVideo.duration = liveSyncPosition;
-                                                if (player.dvr) {
-                                                    player.trigger('dvrwindow', [player, {
-                                                        start: seekOffset,
-                                                        end: liveSyncPosition
-                                                    }]);
-                                                    if (ct < seekOffset) {
-                                                        videoTag.currentTime = seekOffset;
-                                                    }
-                                                }
-                                            }
                                             arg = ct;
                                             break;
                                         case "speed":
@@ -502,37 +492,18 @@
                                             maxLevel = hls.nextLoadLevel;
                                         }
                                         break;
-                                    case "FRAG_PARSING_METADATA":
-                                        data.samples.forEach(function (sample) {
-                                            var metadataHandler;
-
-                                            metadataHandler = function () {
-                                                if (videoTag.currentTime < sample.dts) {
-                                                    return;
-                                                }
-                                                bean.off(videoTag, 'timeupdate.' + engineName, metadataHandler);
-
-                                                var raw = sample.unit || sample.data,
-                                                    Decoder = win.TextDecoder;
-
-                                                if (Decoder && typeof Decoder === "function") {
-                                                    raw = new Decoder('utf-8').decode(raw);
-                                                } else {
-                                                    raw = decodeURIComponent(encodeURIComponent(
-                                                        String.fromCharCode.apply(null, raw)
-                                                    ));
-                                                }
-                                                player.trigger('metadata', [player, {
-                                                    key: raw.substr(10, 4),
-                                                    data: raw
-                                                }]);
-                                            };
-                                            bean.on(videoTag, 'timeupdate.' + engineName, metadataHandler);
-                                        });
-                                        break;
                                     case "LEVEL_UPDATED":
                                         if (player.live) {
-                                            player.video.seekOffset = data.details.fragments[0].start + hls.config.nudgeOffset;
+                                            extend(updatedVideo, {
+                                                seekOffset: data.details.fragments[0].start + hls.config.nudgeOffset,
+                                                duration: hls.liveSyncPosition
+                                            });
+                                            if (player.dvr && player.playing) {
+                                                player.trigger('dvrwindow', [player, {
+                                                    start: updatedVideo.seekOffset,
+                                                    end: hls.liveSyncPosition
+                                                }]);
+                                            }
                                         }
                                         break;
                                     case "BUFFER_APPENDED":
@@ -588,12 +559,14 @@
 
                             hls.attachMedia(videoTag);
 
-                            if (androidChrome && autoplay && videoTag.paused) {
+                            if (autoplay && videoTag.paused) {
                                 var playPromise = videoTag.play();
                                 if (playPromise !== undefined) {
                                     playPromise.catch(function () {
-                                        player.unload();
-                                        player.message("Please click the play button", 3000);
+                                        if (!support.mutedAutoplay) {
+                                            player.unload();
+                                            player.message("Please click the play button", 3000);
+                                        }
                                     });
                                 }
                             }
@@ -608,7 +581,9 @@
                         },
 
                         seek: function (time) {
-                            videoTag.currentTime = time;
+                            if (videoTag) {
+                                videoTag.currentTime = time;
+                            }
                         },
 
                         volume: function (level) {
@@ -640,9 +615,11 @@
                 return engine;
             };
 
-        if (Hls.isSupported() && parseInt(flowplayer.version.split(".")[0]) > 6) {
+        if (Hls.isSupported() &&
+                (parseInt(version.split(".")[0]) > 6 || (/adhoc|dev/.test(version)))) {
             // only load engine if it can be used
             engineImpl.engineName = engineName; // must be exposed
+            engineImpl[engineName + "ClientVersion"] = Hls.version;
             engineImpl.canPlay = function (type, conf) {
                 if (conf[engineName] === false || conf.clip[engineName] === false) {
                     // engine disabled for player
@@ -657,8 +634,25 @@
                 }, conf[engineName], conf.clip[engineName]);
 
                 // https://github.com/dailymotion/hls.js/issues/9
-                return isHlsType(type) && (!desktopSafari || hlsconf.safari);
+                return isHlsType(type) && (!(brwsr.safari && support.dataload) || hlsconf.safari);
             };
+
+            // issue #94
+            if (support.mutedAutoplay && (version === "7.1.1" || version === "7.1.0")) {
+                flowplayer(function (api, root) {
+                    var c = api.conf;
+
+                    if (!c.splash && !c.autoplay) {
+                        api.splash = true;
+                        c.splash = typeof c.poster === "string"
+                            ? c.poster
+                            : true;
+                        c.poster = undefined;
+                        c.autoplay = true;
+                        destroyVideoTag(root);
+                    }
+                });
+            }
 
             // put on top of engine stack
             // so hlsjs is tested before html5 video hls and flash hls
@@ -667,7 +661,7 @@
 
     };
     if (typeof module === 'object' && module.exports) {
-        module.exports = extension.bind(undefined, require('hls.js'));
+        module.exports = extension.bind(undefined, require('hls.js/dist/hls.light.js'));
     } else if (window.Hls && window.flowplayer) {
         extension(window.Hls, window.flowplayer);
     }
